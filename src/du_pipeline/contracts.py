@@ -29,7 +29,10 @@ class Bible:
 class OutputConfig:
  width:int=1920; height:int=1080; fps:int=30; aspect_ratio:str='16:9'; codec:str='H264'; container:str='MP4'; pixel_format:str='yuv420p'; music:bool=False; subtitles:bool=False; srt:bool=False; logo:bool=False; final_hold_seconds:float=1.5; transition:str='hard_cut'
  def __post_init__(self):
-  if (self.width,self.height,self.fps)!=(1920,1080,30) or not 1<=self.final_hold_seconds<=2: raise ValueError('invalid output contract')
+  if self.width<1920 or self.height<1080 or self.fps<30: raise ValueError('minimum 1920x1080 at 30fps')
+  if (self.aspect_ratio,self.codec.upper(),self.container.upper(),self.pixel_format)!=("16:9","H264","MP4","yuv420p"): raise ValueError('immutable encoding contract')
+  if any((self.music,self.subtitles,self.srt,self.logo)): raise ValueError('music/subtitles/SRT/logo forbidden')
+  if not 1<=self.final_hold_seconds<=2: raise ValueError('hold must be 1-2 seconds')
 class ResearchProvider(Protocol):
  def research(self,topic:str)->Mapping[str,Any]:...
 class ScriptProvider(Protocol):

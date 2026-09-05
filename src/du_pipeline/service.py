@@ -21,9 +21,18 @@ class Pipeline:
   pid=str(uuid.uuid4()); self.db.execute("insert into projects(id,name,language,state,style_json,references_json,bible_json,image_provider,whiteboard_mode,seed,transition,blocked_reason,created_at,min_scenes,max_scenes,retention_days,output_json,version) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(pid,name,language,"ACTIVE",json.dumps(style or {}),json.dumps(references or []),json.dumps(bible or {}),image_provider,whiteboard_mode,int(seed),transition,None,now(),lo,hi,retention_days,json.dumps(out.__dict__),1)); self.event(pid,"PROJECT_CREATED",{'seed':seed}); return pid
  def import_audio(self,pid,uri,duration_ms,sha256,role=Role.OPERATOR): self._role(role,'import'); self.db.execute("insert or replace into audio values(?,?,?,?)",(pid,uri,duration_ms,sha256)); self.event(pid,"AUDIO_IMPORTED")
  def import_srt(self,pid,cues,role=Role.OPERATOR):
-  self._role(role,'import'); self.db.execute("delete from cues where project_id=?",(pid,))
-  for i,(s,e,t) in enumerate(cues,1): self.db.execute("insert into cues(project_id,idx,start_ms,end_ms,text) values(?,?,?,?,?)",(pid,i,s,e,t))
-  self.event(pid,"SRT_IMPORTED")
+  self._role(role,'import')
+  rows=list(cues)
+  # Validate the complete replacement before touching persisted cues.
+  audio=self.db.one('select duration_ms from audio where project_id=?',(pid,))
+  validate_timing(audio['duration_ms'] if audio else 0,rows)
+  try:
+   with self.db.conn:
+    self.db.conn.execute("delete from cues where project_id=?",(pid,))
+    self.db.conn.executemany("insert into cues(project_id,idx,start_ms,end_ms,text) values(?,?,?,?,?)",[(pid,i,s,e,t) for i,(s,e,t) in enumerate(rows,1)])
+   self.event(pid,"SRT_IMPORTED")
+  except Exception:
+   self.db.conn.rollback(); raise
  def plan_scenes(self,pid,special_codes=(),role=Role.OPERATOR):
   self._role(role,'plan'); project=self.db.one("select * from projects where id=?",(pid,)); audio=self.db.one("select * from audio where project_id=?",(pid,)); cues=self.db.all("select * from cues where project_id=? order by idx",(pid,))
   try: validate_timing(audio['duration_ms'] if audio else 0,[(x['start_ms'],x['end_ms'],x['text']) for x in cues])
@@ -42,7 +51,10 @@ class Pipeline:
    self.db.execute("insert into scenes(project_id,code,ord,start_ms,end_ms,text,special,state,approval_state) values(?,?,?,?,?,?,?,?,?)",(pid,code,i,s,e,text,special,"PLANNED","REQUIRED" if gate else "NOT_REQUIRED"))
   self.event(pid,"SCENES_PLANNED",{"count":len(planned)}); self.checkpoint(pid,'plan',{'count':len(planned)}); return [dict(x) for x in self.db.all("select * from scenes where project_id=? order by ord",(pid,))]
  def scene(self,sid): return dict(self.db.one("select * from scenes where id=?",(sid,)))
- def queue_retry(self,sid,role=Role.OPERATOR): self._role(role,'retry'); self.db.execute("update scenes set state='RETRY_QUEUED' where id=? and state in ('RETRYABLE','BLOCKED')",(sid,)); return self.scene(sid)
+ def queue_retry(self,sid,role=Role.OPERATOR):
+  self._role(role,'retry'); s=self.db.one('select * from scenes where id=?',(sid,)); self._active(s['project_id'])
+  if self.db.one('select count(*) n from attempts where scene_id=?',(sid,))['n']>=3: raise ValueError('maximum 3 attempts')
+  self.db.execute("update scenes set state='RETRY_QUEUED' where id=? and state in ('RETRYABLE','BLOCKED')",(sid,)); self.create_job(s['project_id'],f'RETRY_IMAGE:{sid}'); return self.scene(sid)
  def record_image_attempt(self,sid,success,failed_binary=None,error=None,provider="codex-gpt-image-2"):
   scene=self.db.one("select * from scenes where id=?",(sid,)); n=self.db.one("select count(*) n from attempts where scene_id=?",(sid,))['n']+1
   if n>3: raise ValueError('maximum 3 attempts')
@@ -64,8 +76,11 @@ class Pipeline:
   self._role(role,'animate')
   if not self.db.one("select 1 from approvals where project_id=? and gate='POST_BATCH' and decision='APPROVED'",(pid,)): raise PermissionError('post-batch human approval required')
   return self.create_job(pid,'ANIMATION')
+ def _active(self,pid):
+  p=self.db.one('select state from projects where id=?',(pid,))
+  if not p or p['state']!='ACTIVE': raise PermissionError('project is not active')
  def create_job(self,pid,kind):
-  t=now(); return self.db.execute("insert into jobs(project_id,kind,state,created_at,updated_at) values(?,?,?,?,?)",(pid,kind,'QUEUED',t,t)).lastrowid
+  self._active(pid); t=now(); return self.db.execute("insert into jobs(project_id,kind,state,created_at,updated_at) values(?,?,?,?,?)",(pid,kind,'QUEUED',t,t)).lastrowid
  def checkpoint(self,pid,stage,data):
   job=self.db.one("select * from jobs where project_id=? order by id desc",(pid,)); jid=job['id'] if job else self.create_job(pid,'PIPELINE')
   self.db.execute("insert into stages(job_id,name,state,checkpoint_json) values(?,?,?,?) on conflict(job_id,name) do update set state=excluded.state,checkpoint_json=excluded.checkpoint_json",(jid,stage,'SUCCEEDED',json.dumps(data)))
