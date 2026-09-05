@@ -211,13 +211,14 @@ class Pipeline:
    self.db.execute("update projects set version=version+1 where id=?",(p['project_id'],))
    if self.db.execute("update proposals set state='APPLIED' where id=? and state='APPROVED'",(i,)).rowcount!=1: raise PermissionError('rerun already applied')
    return self._create_job(p['project_id'],'RERUN:'+stage)
- def add_artifact(self,pid,kind,uri,scene_id=None,parent_id=None,role=Role.OPERATOR):
+ def add_artifact(self,pid,kind,uri,scene_id=None,parent_id=None,role=Role.OPERATOR,_new_copies=None):
   self._role(role,'scene-replace'); source=Path(uri).resolve(strict=True); root=self._root(pid)
   # Ingest into owned storage; callers' arbitrary source URI is never later deleted.
   copied=False
   try: source.relative_to(root); managed=source
   except ValueError:
    managed=root/(uuid.uuid4().hex+source.suffix); shutil.copyfile(source,managed); copied=True
+   if _new_copies is not None: _new_copies.append(managed)
   try:
    digest,_=self._hash(managed); version=self.db.one("select coalesce(max(version),0)+1 v from artifacts where project_id=? and kind=? and scene_id is ?",(pid,kind,scene_id))['v']; days=self.db.one('select retention_days from projects where id=?',(pid,))['retention_days']; expires=(datetime.now(timezone.utc)+timedelta(days=days)).isoformat()
    with self.db.transaction():
@@ -280,12 +281,24 @@ class Pipeline:
   if gate not in {'PILOT','BATCH','FINAL'} or decision not in {'APPROVED','REJECTED'}: raise ValueError('unsupported gate decision')
   self.db.execute("insert into approvals(project_id,gate,decision,actor,created_at) values(?,?,?,?,?)",(pid,gate,decision,actor,now()))
  def replace_scene_artifact(self,sid,uri,role=Role.OPERATOR):
-  self._role(role,'scene-replace'); s=self.scene(int(sid)); self._active(s['project_id'])
-  with self.db.transaction():
-   old=self.db.one("select * from artifacts where scene_id=? and kind='IMAGE' and status='ACTIVE' order by version desc",(s['id'],))
-   if old:self.db.execute("update artifacts set status='SUPERSEDED' where id=?",(old['id'],))
-   aid=self.add_artifact(s['project_id'],'IMAGE',uri,s['id'],old['id'] if old else None,role)
-   self._event(s['project_id'],'SCENE_ARTIFACT_REPLACED',{'scene':s['code'],'artifact':aid})
+  self._role(role,'scene-replace'); s=self.scene(int(sid)); self._active(s['project_id']); new_copies=[]
+  try:
+   with self.db.transaction():
+    old=self.db.one("select * from artifacts where scene_id=? and kind='IMAGE' and status='ACTIVE' order by version desc",(s['id'],))
+    if old:self.db.execute("update artifacts set status='SUPERSEDED' where id=?",(old['id'],))
+    aid=self.add_artifact(s['project_id'],'IMAGE',uri,s['id'],old['id'] if old else None,role,_new_copies=new_copies)
+    self._event(s['project_id'],'SCENE_ARTIFACT_REPLACED',{'scene':s['code'],'artifact':aid})
+  except Exception:
+   # Only compensate files created by this invocation. Re-check both ownership and
+   # references after rollback so a pre-existing/shared or out-of-root path is safe.
+   for copied in new_copies:
+    try:
+     managed=self._owned_path(s['project_id'],copied,must_exist=False)
+     if not self.db.one('select 1 from artifacts where uri=?',(str(managed),)):
+      managed.unlink(missing_ok=True)
+    except (OSError,PermissionError):
+     pass
+   raise
   return aid
  def dispatch_discord(self,text,role):
   c=parse_discord(text); self._role(role,c.name)

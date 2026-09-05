@@ -81,6 +81,33 @@ def test_replace_scene_is_atomic_when_ingest_fails(app, monkeypatch):
     assert db.one("select status from artifacts where id=?", (old,))[0] == "ACTIVE"
 
 
+def test_replace_scene_removes_new_copy_when_final_audit_fails(app, monkeypatch):
+    pipe, db, pid, tmp = app
+    db.execute("insert into scenes(project_id,code,ord,start_ms,end_ms,text,special,state,approval_state) values(?,?,?,?,?,?,?,?,?)", (pid,"S001",1,0,1000,"x",0,"PLANNED","REQUIRED"))
+    sid = db.one("select id from scenes where project_id=?", (pid,))[0]
+    old_source = tmp / "old.png"; old_source.write_bytes(b"old")
+    old = pipe.add_artifact(pid, "IMAGE", old_source, sid)
+    old_uri = Path(db.one("select uri from artifacts where id=?", (old,))[0])
+    root = Path(db.one("select artifact_root from projects where id=?", (pid,))[0])
+    before = set(root.iterdir())
+    new_source = tmp / "new.png"; new_source.write_bytes(b"new")
+    real_event = pipe._event
+
+    def fail_final_event(project_id, event_type, data=None):
+        if event_type == "SCENE_ARTIFACT_REPLACED":
+            raise RuntimeError("final audit fault")
+        return real_event(project_id, event_type, data)
+
+    monkeypatch.setattr(pipe, "_event", fail_final_event)
+    with pytest.raises(RuntimeError, match="final audit fault"):
+        pipe.replace_scene_artifact(sid, new_source)
+
+    artifacts = db.all("select id,status,uri from artifacts where scene_id=?", (sid,))
+    assert [(row["id"], row["status"]) for row in artifacts] == [(old, "ACTIVE")]
+    assert old_uri.is_file()
+    assert set(root.iterdir()) == before
+
+
 def test_cross_project_artifact_update_is_rejected(app):
     pipe, db, pid, tmp = app
     other = pipe.init_project("other", scene_range=(1, 5))
