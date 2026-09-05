@@ -12,11 +12,13 @@ def project(tmp_path):
 def test_gates_retry_checkpoints_and_rerun(tmp_path):
  d,p,pid,scenes=project(tmp_path)
  with pytest.raises(PermissionError): p.start_batch(pid)
- for s in scenes:p.decide_scene(pid,s['code'],'APPROVED','r')
+ for s in scenes:
+  p.record_image_attempt(s['id'],True); p.record_scene_qa(s['id'],True); p.decide_scene(pid,s['code'],'APPROVED','r')
  assert p.start_batch(pid)
  with pytest.raises(PermissionError):p.start_animation(pid)
  with pytest.raises(ValueError):p.approve_post_batch(pid,False,'sheet','r')
- p.approve_post_batch(pid,True,'sheet','r'); assert p.start_animation(pid)
+ sheet=tmp_path/'sheet.png'; sheet.write_bytes(b'sheet')
+ p.approve_post_batch(pid,True,str(sheet),'r'); assert p.start_animation(pid)
  p.record_image_attempt(scenes[0]['id'],False,error='x'); before=d.one('select count(*) n from attempts')['n']; p.queue_retry(scenes[0]['id']); assert d.one('select count(*) n from attempts')['n']==before
  proposal=p.propose_rerun(pid,'plan');
  with pytest.raises(PermissionError):p.apply_rerun(proposal)

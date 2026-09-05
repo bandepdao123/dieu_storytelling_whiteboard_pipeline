@@ -1,12 +1,13 @@
 import hashlib,json,os,uuid,random
 from datetime import datetime,timezone,timedelta
 from .policies import validate_timing,required_approval,DurationPolicy
-from .contracts import OutputConfig
+from .contracts import OutputConfig,ContactSheetArtifact
+from .policies import ResourceScheduler
 from .adapters import Role,authorize,parse_discord
 
 def now(): return datetime.now(timezone.utc).isoformat()
 class Pipeline:
- def __init__(self,db,duration_policy=None): self.db=db; self.duration_policy=duration_policy or DurationPolicy()
+ def __init__(self,db,duration_policy=None,scheduler=None): self.db=db; self.duration_policy=duration_policy or DurationPolicy(); self.scheduler=scheduler or ResourceScheduler()
  def _role(self,role,command):
   try:r=role if isinstance(role,Role) else Role(role)
   except Exception as e: raise PermissionError('valid role required') from e
@@ -63,15 +64,19 @@ class Pipeline:
    path=os.path.abspath(failed_binary); data=open(path,'rb').read(); digest=hashlib.sha256(data).hexdigest(); size=len(data); os.remove(path)
   state="SUCCEEDED" if success else "FAILED"; self.db.execute("insert into attempts(scene_id,number,provider,state,error,failed_path,failed_sha256,failed_size,created_at) values(?,?,?,?,?,?,?,?,?)",(sid,n,provider,state,error,path,digest,size,now()))
   self.db.execute("update scenes set state=?,checkpoint_json=? where id=?",("IMAGE_READY" if success else ("BLOCKED" if n==3 else "RETRYABLE"),json.dumps({'attempt':n}),sid)); self.event(scene['project_id'],"IMAGE_ATTEMPT",{"scene":scene['code'],"number":n,"state":state})
- def _pilot_ready(self,pid): return not self.db.one("select 1 from scenes where project_id=? and approval_state='REQUIRED'",(pid,))
+ def record_scene_qa(self,sid,passed): self.db.execute("update scenes set qa_state=? where id=?",('PASS' if passed else 'FAIL',sid))
+ def _pilot_ready(self,pid): return not self.db.one("select 1 from scenes where project_id=? and (ord<=5 or special=1) and not(state='IMAGE_READY' and qa_state='PASS' and approval_state='APPROVED')",(pid,))
  def start_batch(self,pid,role=Role.OPERATOR):
   self._role(role,'batch')
   if not self._pilot_ready(pid): raise PermissionError('pilot S001-S005 and special representatives require approval')
   return self.create_job(pid,'BATCH_IMAGE')
  def approve_post_batch(self,pid,ai_qa,contact_sheet,actor,role=Role.REVIEWER):
   self._role(role,'approve')
-  if not ai_qa or not contact_sheet: raise ValueError('AI QA and contact sheet required')
+  if not ai_qa or not contact_sheet or not os.path.isfile(contact_sheet): raise ValueError('AI QA and persisted contact sheet required')
+  if self.db.one("select 1 from scenes where project_id=? and (state!='IMAGE_READY' or qa_state!='PASS')",(pid,)): raise PermissionError('complete batch and every scene QA PASS required')
+  aid=self.add_artifact(pid,'CONTACT_SHEET',contact_sheet)
   self.db.execute("insert into approvals(project_id,gate,decision,actor,created_at) values(?,?,?,?,?)",(pid,'POST_BATCH','APPROVED',actor,now()))
+  a=self.db.one('select * from artifacts where id=?',(aid,)); return ContactSheetArtifact(a['id'],a['project_id'],a['uri'],a['sha256'],a['version'],a['status'])
  def start_animation(self,pid,role=Role.OPERATOR):
   self._role(role,'animate')
   if not self.db.one("select 1 from approvals where project_id=? and gate='POST_BATCH' and decision='APPROVED'",(pid,)): raise PermissionError('post-batch human approval required')
@@ -81,6 +86,25 @@ class Pipeline:
   if not p or p['state']!='ACTIVE': raise PermissionError('project is not active')
  def create_job(self,pid,kind):
   self._active(pid); t=now(); return self.db.execute("insert into jobs(project_id,kind,state,created_at,updated_at) values(?,?,?,?,?)",(pid,kind,'QUEUED',t,t)).lastrowid
+ def pause_job(self,jid,role=Role.OPERATOR): self._role(role,'pause'); self.db.execute("update jobs set state='PAUSED',updated_at=? where id=? and state in ('QUEUED','RUNNING')",(now(),jid))
+ def resume_job(self,jid,role=Role.OPERATOR): self._role(role,'resume'); self.db.execute("update jobs set state='QUEUED',updated_at=? where id=? and state='PAUSED'",(now(),jid))
+ def execute_images(self,scene_ids,outcomes):
+  """Deterministic local executor; one scene failure never aborts siblings."""
+  for sid in scene_ids:
+   self.scheduler.submit('image',sid)
+  while True:
+   admitted=self.scheduler.acquire()
+   if not admitted: break
+   kind,sid=admitted
+   try:
+    sequence=iter(outcomes.get(sid,(True,)))
+    while self.db.one('select count(*) n from attempts where scene_id=?',(sid,))['n']<3:
+     try: success=bool(next(sequence))
+     except StopIteration: break
+     self.record_image_attempt(sid,success,error=None if success else 'fake failure')
+     if success: break
+   finally: self.scheduler.release(kind)
+  return [self.scene(s) for s in scene_ids]
  def checkpoint(self,pid,stage,data):
   job=self.db.one("select * from jobs where project_id=? order by id desc",(pid,)); jid=job['id'] if job else self.create_job(pid,'PIPELINE')
   self.db.execute("insert into stages(job_id,name,state,checkpoint_json) values(?,?,?,?) on conflict(job_id,name) do update set state=excluded.state,checkpoint_json=excluded.checkpoint_json",(jid,stage,'SUCCEEDED',json.dumps(data)))
@@ -119,9 +143,10 @@ class Pipeline:
   else: raise ValueError('unsupported command')
   return {'ok':True}
  def observe_cost(self,pid,provider,currency,amount): self.db.execute("insert into cost_observations(project_id,provider,currency,amount,created_at) values(?,?,?,?,?)",(pid,provider,currency,amount,now()))
- def propose_dependency(self,pid,dependency,impact,proposer="system"): return self.db.execute("insert into impact_proposals(project_id,dependency,impact_json,state,proposer,created_at) values(?,?,?,?,?,?)",(pid,dependency,json.dumps(impact),"PROPOSED",proposer,now())).lastrowid
- def decide_dependency(self,i,approved,actor): self.db.execute("update impact_proposals set state=?,decider=?,decided_at=? where id=? and state='PROPOSED'",("APPROVED" if approved else "REJECTED",actor,now(),i))
- def apply_dependency(self,i):
+ def propose_dependency(self,pid,dependency,impact,proposer="system",role=Role.OPERATOR): self._role(role,'dependency-propose'); return self.db.execute("insert into impact_proposals(project_id,dependency,impact_json,state,proposer,created_at) values(?,?,?,?,?,?)",(pid,dependency,json.dumps(impact),"PROPOSED",proposer,now())).lastrowid
+ def decide_dependency(self,i,approved,actor,role=Role.OWNER): self._role(role,'approve'); self.db.execute("update impact_proposals set state=?,decider=?,decided_at=? where id=? and state='PROPOSED'",("APPROVED" if approved else "REJECTED",actor,now(),i))
+ def apply_dependency(self,i,role=Role.OWNER):
+  self._role(role,'dependency')
   p=self.db.one("select * from impact_proposals where id=?",(i,))
   if not p or p['state']!='APPROVED': raise PermissionError('approval required')
   self.db.execute("update impact_proposals set state='APPLIED',applied_at=? where id=?",(now(),i)); self.event(p['project_id'],"DEPENDENCY_APPLIED",{"dependency":p['dependency']})
