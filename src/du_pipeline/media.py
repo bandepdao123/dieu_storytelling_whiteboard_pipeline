@@ -28,9 +28,16 @@ class FastWhiteboardAdapter:
         subprocess.run(cmd,check=True); probe(output); return output
 
 class FinalAssembler:
-    def command(self,concat_file,output): return ['ffmpeg','-y','-f','concat','-safe','0','-i',str(concat_file),'-c:v','libx264','-pix_fmt','yuv420p','-r','30','-an',str(output)]
-    def assemble(self,concat_file,output,*,dry_run=False,fake=False):
-        cmd=self.command(concat_file,output)
+    def __init__(self,managed_root=None,timeout=300): self.managed_root=Path(managed_root).resolve() if managed_root else None; self.timeout=timeout
+    def command(self,concat_file,output): return ['ffmpeg','-y','-f','concat','-safe','1','-i',str(concat_file),'-c:v','libx264','-pix_fmt','yuv420p','-r','30','-an',str(output)]
+    def _validate(self,concat_file):
+        if not self.managed_root: return
+        cf=Path(concat_file).resolve(strict=True); cf.relative_to(self.managed_root)
+        for line in cf.read_text().splitlines():
+            if line.strip().startswith('file '):
+                value=line.strip()[5:].strip().strip("'\""); p=(cf.parent/value).resolve(strict=True); p.relative_to(self.managed_root)
+    def assemble(self,concat_file,output,*,dry_run=False,fake=False,runner=subprocess.run):
+        self._validate(concat_file); cmd=self.command(concat_file,output)
         if dry_run:return cmd
         if fake: Path(output).write_bytes(b'fake-final'); return output
-        subprocess.run(cmd,check=True); probe(output); return output
+        runner(cmd,check=True,capture_output=True,text=True,timeout=self.timeout); probe(output); return output

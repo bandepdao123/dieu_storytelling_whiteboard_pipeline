@@ -1,4 +1,5 @@
-import hashlib,json,os,uuid,random
+import hashlib,json,os,uuid,random,shutil
+from pathlib import Path
 from datetime import datetime,timezone,timedelta
 from .policies import validate_timing,required_approval,DurationPolicy
 from .contracts import OutputConfig,ContactSheetArtifact,QAEvidence
@@ -13,6 +14,22 @@ class Pipeline:
   try:r=role if isinstance(role,Role) else Role(role)
   except Exception as e: raise PermissionError('valid role required') from e
   if not authorize(r,command): raise PermissionError(f'{r.value} cannot {command}')
+ def _root(self,pid):
+  p=self.db.one('select artifact_root from projects where id=?',(pid,))
+  if not p: raise ValueError('project not found')
+  root=Path(p['artifact_root'] or (self.db.path.parent/'artifacts'/pid)).resolve(); root.mkdir(parents=True,exist_ok=True); return root
+ def _owned_path(self,pid,path,must_exist=True):
+  root=self._root(pid); candidate=Path(path)
+  if not candidate.is_absolute(): candidate=root/candidate
+  candidate=candidate.resolve(strict=must_exist)
+  try: candidate.relative_to(root)
+  except ValueError as exc: raise PermissionError('path escapes managed artifact root') from exc
+  return candidate
+ def _hash(self,path):
+  h=hashlib.sha256(); size=0
+  with open(path,'rb') as stream:
+   for chunk in iter(lambda:stream.read(1024*1024),b''): h.update(chunk); size+=len(chunk)
+  return h.hexdigest(),size
  def event(self,pid,typ,data=None): self.db.execute("insert into events(project_id,type,data_json,created_at) values(?,?,?,?)",(pid,typ,json.dumps(data or {}),now()))
  def init_project(self,name,language="vi",seed=0,style=None,references=None,bible=None,image_provider="codex-gpt-image-2",whiteboard_mode="ask",transition="hard_cut",scene_range=(50,360),retention_days=3,output=None,role=Role.OWNER):
   self._role(role,'init')
@@ -20,7 +37,12 @@ class Pipeline:
   lo,hi=scene_range
   if lo<1 or hi<lo or hi>360: raise ValueError('scene range')
   out=output or OutputConfig(transition=transition)
-  pid=str(uuid.uuid4()); self.db.execute("insert into projects(id,name,language,state,style_json,references_json,bible_json,image_provider,whiteboard_mode,seed,transition,blocked_reason,created_at,min_scenes,max_scenes,retention_days,output_json,version) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(pid,name,language,"ACTIVE",json.dumps(style or {}),json.dumps(references or []),json.dumps(bible or {}),image_provider,whiteboard_mode,int(seed),transition,None,now(),lo,hi,retention_days,json.dumps(out.__dict__),1)); self.event(pid,"PROJECT_CREATED",{'seed':seed}); return pid
+  pid=str(uuid.uuid4()); root=(self.db.path.parent/'artifacts'/pid).resolve(); root.mkdir(parents=True,exist_ok=False)
+  try:
+   with self.db.transaction():
+    self.db.execute("insert into projects(id,name,language,state,style_json,references_json,bible_json,image_provider,whiteboard_mode,seed,transition,blocked_reason,created_at,min_scenes,max_scenes,retention_days,output_json,version,artifact_root) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(pid,name,language,"ACTIVE",json.dumps(style or {}),json.dumps(references or []),json.dumps(bible or {}),image_provider,whiteboard_mode,int(seed),transition,None,now(),lo,hi,retention_days,json.dumps(out.__dict__),1,str(root))); self.event(pid,"PROJECT_CREATED",{'seed':seed})
+  except Exception: shutil.rmtree(root,ignore_errors=True); raise
+  return pid
  def import_audio(self,pid,uri,duration_ms,sha256,role=Role.OPERATOR): self._role(role,'import'); self.db.execute("insert or replace into audio values(?,?,?,?)",(pid,uri,duration_ms,sha256)); self.event(pid,"AUDIO_IMPORTED")
  def import_srt(self,pid,cues,role=Role.OPERATOR):
   self._role(role,'import')
@@ -79,9 +101,14 @@ class Pipeline:
   if scene['ord']>5 and not scene['special'] and not self._pilot_ready(scene['project_id']): raise PermissionError('pilot approval required before batch images')
   path=digest=size=None
   if failed_binary and os.path.isfile(failed_binary):
-   path=os.path.abspath(failed_binary); data=open(path,'rb').read(); digest=hashlib.sha256(data).hexdigest(); size=len(data); os.remove(path)
-  state="SUCCEEDED" if success else "FAILED"; self.db.execute("insert into attempts(scene_id,number,provider,state,error,failed_path,failed_sha256,failed_size,created_at) values(?,?,?,?,?,?,?,?,?)",(sid,n,provider,state,error,path,digest,size,now()))
-  self.db.execute("update scenes set state=?,checkpoint_json=? where id=?",("IMAGE_READY" if success else ("BLOCKED" if n==3 else "RETRYABLE"),json.dumps({'attempt':n}),sid)); self.event(scene['project_id'],"IMAGE_ATTEMPT",{"scene":scene['code'],"number":n,"state":state})
+   try: owned=self._owned_path(scene['project_id'],failed_binary)
+   except PermissionError: owned=None
+   if owned: path=str(owned); digest,size=self._hash(owned)
+  state="SUCCEEDED" if success else "FAILED"
+  with self.db.transaction():
+   self.db.execute("insert into attempts(scene_id,number,provider,state,error,failed_path,failed_sha256,failed_size,created_at) values(?,?,?,?,?,?,?,?,?)",(sid,n,provider,state,error,path,digest,size,now()))
+   self.db.execute("update scenes set state=?,checkpoint_json=? where id=?",("IMAGE_READY" if success else ("BLOCKED" if n==3 else "RETRYABLE"),json.dumps({'attempt':n}),sid)); self.event(scene['project_id'],"IMAGE_ATTEMPT",{"scene":scene['code'],"number":n,"state":state})
+  if path: Path(path).unlink(missing_ok=True)
  def record_scene_qa(self,sid,evidence):
   if not isinstance(evidence,QAEvidence): raise TypeError('QAEvidence required')
   s=self.db.one('select * from scenes where id=?',(sid,)); self._active(s['project_id'])
@@ -119,8 +146,12 @@ class Pipeline:
   if not p or p['state']!='ACTIVE': raise PermissionError('project is not active')
  def create_job(self,pid,kind):
   self._active(pid); t=now(); return self.db.execute("insert into jobs(project_id,kind,state,created_at,updated_at) values(?,?,?,?,?)",(pid,kind,'QUEUED',t,t)).lastrowid
- def pause_job(self,jid,role=Role.OPERATOR): self._role(role,'pause'); self.db.execute("update jobs set state='PAUSED',updated_at=? where id=? and state in ('QUEUED','RUNNING')",(now(),jid))
- def resume_job(self,jid,role=Role.OPERATOR): self._role(role,'resume'); self.db.execute("update jobs set state='QUEUED',updated_at=? where id=? and state='PAUSED'",(now(),jid))
+ def pause_job(self,jid,role=Role.OPERATOR):
+  self._role(role,'pause')
+  if self.db.execute("update jobs set state='PAUSED',updated_at=? where id=? and state in ('QUEUED','RUNNING')",(now(),jid)).rowcount!=1: raise PermissionError('illegal job pause transition')
+ def resume_job(self,jid,role=Role.OPERATOR):
+  self._role(role,'resume')
+  if self.db.execute("update jobs set state='QUEUED',updated_at=? where id=? and state='PAUSED'",(now(),jid)).rowcount!=1: raise PermissionError('illegal job resume transition')
  def execute_images(self,scene_ids,outcomes):
   """Deterministic local executor; one scene failure never aborts siblings."""
   pending=iter(scene_ids); exhausted=False
@@ -161,9 +192,14 @@ class Pipeline:
    if a['kind'].lower() in downstream:self.db.execute("update artifacts set status='SUPERSEDED' where id=?",(a['id'],))
   self.db.execute("update projects set version=version+1 where id=?",(p['project_id'],))
   self.db.execute("update proposals set state='APPLIED' where id=?",(i,)); return self.create_job(p['project_id'],'RERUN:'+stage)
- def add_artifact(self,pid,kind,uri,scene_id=None,parent_id=None):
-  data=open(uri,'rb').read(); digest=hashlib.sha256(data).hexdigest(); version=self.db.one("select coalesce(max(version),0)+1 v from artifacts where project_id=? and kind=? and scene_id is ?",(pid,kind,scene_id))['v']; days=self.db.one('select retention_days from projects where id=?',(pid,))['retention_days']; expires=(datetime.now(timezone.utc)+timedelta(days=days)).isoformat()
-  return self.db.execute("insert into artifacts(project_id,scene_id,kind,uri,sha256,version,parent_id,status,created_at,expires_at) values(?,?,?,?,?,?,?,?,?,?)",(pid,scene_id,kind,uri,digest,version,parent_id,"ACTIVE",now(),expires)).lastrowid
+ def add_artifact(self,pid,kind,uri,scene_id=None,parent_id=None,role=Role.OPERATOR):
+  self._role(role,'scene-replace'); source=Path(uri).resolve(strict=True); root=self._root(pid)
+  # Ingest into owned storage; callers' arbitrary source URI is never later deleted.
+  try: source.relative_to(root); managed=source
+  except ValueError:
+   managed=root/(uuid.uuid4().hex+source.suffix); shutil.copyfile(source,managed)
+  digest,_=self._hash(managed); version=self.db.one("select coalesce(max(version),0)+1 v from artifacts where project_id=? and kind=? and scene_id is ?",(pid,kind,scene_id))['v']; days=self.db.one('select retention_days from projects where id=?',(pid,))['retention_days']; expires=(datetime.now(timezone.utc)+timedelta(days=days)).isoformat()
+  return self.db.execute("insert into artifacts(project_id,scene_id,kind,uri,sha256,version,parent_id,status,created_at,expires_at) values(?,?,?,?,?,?,?,?,?,?)",(pid,scene_id,kind,str(managed),digest,version,parent_id,"ACTIVE",now(),expires)).lastrowid
  def restore_artifact(self,artifact_id):
   a=self.db.one('select * from artifacts where id=?',(artifact_id,))
   if not a or a['status']=='DELETED' or not os.path.isfile(a['uri']): raise FileNotFoundError('artifact binary unavailable')
@@ -172,10 +208,21 @@ class Pipeline:
   self._role(role,'cleanup')
   immutable=('INPUT','MANIFEST','DB','PROMPT','BIBLE','QA_METADATA','CHECKSUM','FINAL')
   rows=self.db.all("select * from artifacts where status='ACTIVE' and expires_at<? and upper(kind) not in (%s)" % ','.join('?'*len(immutable)),(now(),*immutable))
+  count=0
   for r in rows:
-   if os.path.isfile(r['uri']): os.remove(r['uri'])
-   self.db.execute("update artifacts set status='DELETED',deleted_at=? where id=?",(now(),r['id']))
-  return len(rows)
+   try: path=self._owned_path(r['project_id'],r['uri'],must_exist=False)
+   except PermissionError: continue
+   # Rename first (same filesystem), commit audit state, then unlink staged data.
+   staged=path.with_name(path.name+'.deleting-'+uuid.uuid4().hex)
+   if path.is_file(): path.replace(staged)
+   try:
+    with self.db.transaction():
+     if self.db.execute("update artifacts set status='DELETED',deleted_at=? where id=? and status='ACTIVE'",(now(),r['id'])).rowcount!=1: raise RuntimeError('cleanup race')
+   except Exception:
+    if staged.exists(): staged.replace(path)
+    raise
+   staged.unlink(missing_ok=True); count+=1
+  return count
  def cleanup_schedule(self): return {'task':'artifact_cleanup','interval_seconds':3600,'handler':self.cleanup}
  def decide_scene(self,pid,code,decision,actor,role=Role.REVIEWER):
   self._role(role,'approve' if decision=='APPROVED' else 'reject'); s=self.db.one("select * from scenes where project_id=? and code=?",(pid,code))
@@ -187,6 +234,7 @@ class Pipeline:
   legacy={'approve':'scene-approve','reject':'scene-reject','pause':'project-pause','resume':'project-resume','retry':'scene-retry','status':'project-status'}
   c=type(c)(legacy.get(c.name,c.name),c.args)
   schemas={'project-create':(1,2),'project-status':(1,1),'project-config':(3,3),'project-start':(1,1),'project-pause':(1,1),'project-resume':(1,1),'project-cancel':(1,1),'import':(2,2),'plan':(1,1),'pilot-approve':(1,1),'pilot-reject':(1,1),'batch-approve':(1,1),'batch-reject':(1,1),'scene-status':(2,2),'scene-retry':(1,1),'scene-approve':(2,2),'scene-reject':(2,2),'scene-replace':(2,2),'stage-run':(2,2),'stage-rerun':(2,2),'checkpoint-list':(1,1),'checkpoint-restore':(2,2),'dependency-propose':(3,3),'dependency-approve':(1,1),'dependency-apply':(1,1),'provider-select':(2,2),'preset-select':(2,2),'cost-report':(1,1),'error-report':(1,1),'final-approve':(1,1)}
+  if c.name not in schemas: raise CommandError('UNKNOWN_COMMAND',c.name)
   lo,hi=schemas[c.name]
   if not lo<=len(c.args)<=hi: raise CommandError('INVALID_ARGUMENTS',f'{c.name} expects {lo}..{hi} arguments')
   a=c.args

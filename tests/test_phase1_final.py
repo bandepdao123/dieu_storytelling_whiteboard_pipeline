@@ -28,7 +28,7 @@ def test_command_schema_and_rbac_never_indexerror(tmp_path):
 def test_cleanup_preserves_immutable_and_is_idempotent(tmp_path):
  p,pid=pipe(tmp_path,6000,(0,6000,'x')); keep=tmp_path/'keep'; drop=tmp_path/'drop'; keep.write_bytes(b'k'); drop.write_bytes(b'd')
  p.add_artifact(pid,'FINAL',str(keep)); p.add_artifact(pid,'IMAGE',str(drop)); p.db.execute("update artifacts set expires_at='2000-01-01T00:00:00+00:00'")
- assert p.cleanup()==1 and not drop.exists() and keep.exists(); assert p.cleanup()==0
+ assert p.cleanup()==1 and drop.exists() and keep.exists(); assert p.cleanup()==0
  with pytest.raises(PermissionError):p.cleanup(Role.OPERATOR)
 
 def test_latest_checkpoint_and_rerun_version(tmp_path):

@@ -21,7 +21,7 @@ Runtime dùng hoàn toàn Python standard library. Python >=3.11.
 ```bash
 du-pipeline --db demo.db init "Demo" --language vi --seed 42
 # lấy project_id từ JSON, rồi:
-du-pipeline --db demo.db import-audio PROJECT_ID narration.wav 60000 SHA256
+du-pipeline --db demo.db import-audio PROJECT_ID narration.wav 60000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 du-pipeline --db demo.db import-srt PROJECT_ID narration.srt
 du-pipeline --db demo.db plan PROJECT_ID
 du-pipeline --db demo.db status PROJECT_ID

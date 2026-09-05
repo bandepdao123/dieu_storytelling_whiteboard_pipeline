@@ -1,5 +1,10 @@
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
+
+SCHEMA_VERSION = 2
+
+class SchemaVersionError(RuntimeError): pass
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS projects(
@@ -27,19 +32,51 @@ CREATE TABLE IF NOT EXISTS learning_metadata(id INTEGER PRIMARY KEY,project_id T
 APPEND=("events","cost_observations","time_observations","learning_metadata")
 class Database:
  def __init__(self,path):
-  self.path=Path(path); self.conn=sqlite3.connect(self.path); self.conn.row_factory=sqlite3.Row
-  self.conn.execute('PRAGMA foreign_keys=ON'); self.conn.execute('PRAGMA journal_mode=WAL'); self.conn.executescript(SCHEMA)
-  # Additive migration for databases produced by v1.
-  cols={r[1] for r in self.conn.execute('pragma table_info(projects)')}
-  for name,ddl in [('min_scenes','INTEGER NOT NULL DEFAULT 50'),('max_scenes','INTEGER NOT NULL DEFAULT 360'),('retention_days','INTEGER NOT NULL DEFAULT 3'),('output_json',"TEXT NOT NULL DEFAULT '{}'") ,('version','INTEGER NOT NULL DEFAULT 1')]:
-   if name not in cols:self.conn.execute(f'ALTER TABLE projects ADD COLUMN {name} {ddl}')
-  scene_cols={r[1] for r in self.conn.execute('pragma table_info(scenes)')}
-  for name,ddl in [('qa_state',"TEXT NOT NULL DEFAULT 'PENDING'"),('qa_json',"TEXT NOT NULL DEFAULT '{}'"),('duration_exception','TEXT')]:
-   if name not in scene_cols:self.conn.execute(f'ALTER TABLE scenes ADD COLUMN {name} {ddl}')
-  for t in APPEND:
-   self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS {t}_no_update BEFORE UPDATE ON {t} BEGIN SELECT RAISE(ABORT,'append only'); END")
-   self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS {t}_no_delete BEFORE DELETE ON {t} BEGIN SELECT RAISE(ABORT,'append only'); END")
-  self.conn.commit()
- def execute(self,sql,args=()): cur=self.conn.execute(sql,args); self.conn.commit(); return cur
+  self.path=Path(path); self.conn=sqlite3.connect(self.path); self.conn.row_factory=sqlite3.Row; self._tx_depth=0
+  self.conn.execute('PRAGMA foreign_keys=ON'); self.conn.execute('PRAGMA journal_mode=WAL')
+  version=self.conn.execute('PRAGMA user_version').fetchone()[0]
+  if version>SCHEMA_VERSION: raise SchemaVersionError(f'unsupported schema version {version}')
+  try:
+   self.conn.execute('BEGIN IMMEDIATE')
+   self.conn.executescript(SCHEMA)
+   # Versioned, additive upgrade from the original schema (user_version 0/1).
+   cols={r[1] for r in self.conn.execute('pragma table_info(projects)')}
+   additions=[('min_scenes','INTEGER NOT NULL DEFAULT 50'),('max_scenes','INTEGER NOT NULL DEFAULT 360'),('retention_days','INTEGER NOT NULL DEFAULT 3'),('output_json',"TEXT NOT NULL DEFAULT '{}'") ,('version','INTEGER NOT NULL DEFAULT 1'),('artifact_root','TEXT')]
+   for name,ddl in additions:
+    if name not in cols:self.conn.execute(f'ALTER TABLE projects ADD COLUMN {name} {ddl}')
+   scene_cols={r[1] for r in self.conn.execute('pragma table_info(scenes)')}
+   for name,ddl in [('qa_state',"TEXT NOT NULL DEFAULT 'PENDING'"),('qa_json',"TEXT NOT NULL DEFAULT '{}'"),('duration_exception','TEXT')]:
+    if name not in scene_cols:self.conn.execute(f'ALTER TABLE scenes ADD COLUMN {name} {ddl}')
+   for t in APPEND:
+    self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS {t}_no_update BEFORE UPDATE ON {t} BEGIN SELECT RAISE(ABORT,'append only'); END")
+    self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS {t}_no_delete BEFORE DELETE ON {t} BEGIN SELECT RAISE(ABORT,'append only'); END")
+   # Composite ownership safeguards without rebuilding legacy tables.
+   self.conn.executescript('''
+CREATE TRIGGER IF NOT EXISTS artifact_scene_project BEFORE INSERT ON artifacts WHEN NEW.scene_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM scenes WHERE id=NEW.scene_id AND project_id=NEW.project_id) BEGIN SELECT RAISE(ABORT,'cross-project scene'); END;
+CREATE TRIGGER IF NOT EXISTS artifact_parent_project BEFORE INSERT ON artifacts WHEN NEW.parent_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM artifacts WHERE id=NEW.parent_id AND project_id=NEW.project_id) BEGIN SELECT RAISE(ABORT,'cross-project parent'); END;
+CREATE TRIGGER IF NOT EXISTS approval_scene_project BEFORE INSERT ON approvals WHEN NEW.scene_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM scenes WHERE id=NEW.scene_id AND project_id=NEW.project_id) BEGIN SELECT RAISE(ABORT,'cross-project approval'); END;
+''')
+   self.conn.execute(f'PRAGMA user_version={SCHEMA_VERSION}'); self.conn.commit()
+  except Exception:
+   self.conn.rollback(); raise
+  if self.conn.execute('PRAGMA integrity_check').fetchone()[0]!='ok': raise sqlite3.DatabaseError('integrity check failed')
+  if self.conn.execute('PRAGMA foreign_key_check').fetchone(): raise sqlite3.IntegrityError('foreign key check failed')
+ @contextmanager
+ def transaction(self):
+  outer=self._tx_depth==0
+  if outer:self.conn.execute('BEGIN IMMEDIATE')
+  self._tx_depth+=1
+  try:
+   yield self
+   self._tx_depth-=1
+   if outer:self.conn.commit()
+  except Exception:
+   self._tx_depth-=1
+   if outer:self.conn.rollback()
+   raise
+ def execute(self,sql,args=()):
+  cur=self.conn.execute(sql,args)
+  if not self._tx_depth:self.conn.commit()
+  return cur
  def one(self,sql,args=()): return self.conn.execute(sql,args).fetchone()
  def all(self,sql,args=()): return self.conn.execute(sql,args).fetchall()

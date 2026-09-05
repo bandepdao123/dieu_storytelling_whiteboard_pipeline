@@ -15,7 +15,8 @@ def test_project_plan_retry_audit_artifact_and_retention(tmp_path):
     sid = scenes[0]["id"]
     failed = tmp_path / "failed.bin"; failed.write_bytes(b"bad")
     for n in range(1, 4): p.record_image_attempt(sid, False, str(failed) if n == 1 else None, "oops")
-    assert not failed.exists()
+    # Unmanaged caller files are never deleted.
+    assert failed.exists()
     assert p.scene(sid)["state"] == "BLOCKED"
     assert p.scene(scenes[1]["id"])["state"] != "BLOCKED"
     with pytest.raises(ValueError): p.record_image_attempt(sid, True)
