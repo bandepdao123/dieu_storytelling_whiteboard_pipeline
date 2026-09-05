@@ -30,7 +30,10 @@ class Pipeline:
   with open(path,'rb') as stream:
    for chunk in iter(lambda:stream.read(1024*1024),b''): h.update(chunk); size+=len(chunk)
   return h.hexdigest(),size
- def event(self,pid,typ,data=None): self.db.execute("insert into events(project_id,type,data_json,created_at) values(?,?,?,?)",(pid,typ,json.dumps(data or {}),now()))
+ def _event(self,pid,typ,data=None): self.db.execute("insert into events(project_id,type,data_json,created_at) values(?,?,?,?)",(pid,typ,json.dumps(data or {}),now()))
+ def event(self,*args,**kwargs):
+  """Events are audit records and may only be emitted by service use-cases."""
+  raise PermissionError('direct event insertion is not permitted')
  def init_project(self,name,language="vi",seed=0,style=None,references=None,bible=None,image_provider="codex-gpt-image-2",whiteboard_mode="ask",transition="hard_cut",scene_range=(50,360),retention_days=3,output=None,role=Role.OWNER):
   self._role(role,'init')
   if language not in ('vi','en') or not name.strip(): raise ValueError('project input')
@@ -40,10 +43,13 @@ class Pipeline:
   pid=str(uuid.uuid4()); root=(self.db.path.parent/'artifacts'/pid).resolve(); root.mkdir(parents=True,exist_ok=False)
   try:
    with self.db.transaction():
-    self.db.execute("insert into projects(id,name,language,state,style_json,references_json,bible_json,image_provider,whiteboard_mode,seed,transition,blocked_reason,created_at,min_scenes,max_scenes,retention_days,output_json,version,artifact_root) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(pid,name,language,"ACTIVE",json.dumps(style or {}),json.dumps(references or []),json.dumps(bible or {}),image_provider,whiteboard_mode,int(seed),transition,None,now(),lo,hi,retention_days,json.dumps(out.__dict__),1,str(root))); self.event(pid,"PROJECT_CREATED",{'seed':seed})
+    self.db.execute("insert into projects(id,name,language,state,style_json,references_json,bible_json,image_provider,whiteboard_mode,seed,transition,blocked_reason,created_at,min_scenes,max_scenes,retention_days,output_json,version,artifact_root) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(pid,name,language,"ACTIVE",json.dumps(style or {}),json.dumps(references or []),json.dumps(bible or {}),image_provider,whiteboard_mode,int(seed),transition,None,now(),lo,hi,retention_days,json.dumps(out.__dict__),1,str(root))); self._event(pid,"PROJECT_CREATED",{'seed':seed})
   except Exception: shutil.rmtree(root,ignore_errors=True); raise
   return pid
- def import_audio(self,pid,uri,duration_ms,sha256,role=Role.OPERATOR): self._role(role,'import'); self.db.execute("insert or replace into audio values(?,?,?,?)",(pid,uri,duration_ms,sha256)); self.event(pid,"AUDIO_IMPORTED")
+ def import_audio(self,pid,uri,duration_ms,sha256,role=Role.OPERATOR):
+  self._role(role,'import'); self._active(pid)
+  with self.db.transaction():
+   self.db.execute("insert or replace into audio values(?,?,?,?)",(pid,uri,duration_ms,sha256)); self._event(pid,"AUDIO_IMPORTED")
  def import_srt(self,pid,cues,role=Role.OPERATOR):
   self._role(role,'import')
   rows=list(cues)
@@ -53,7 +59,7 @@ class Pipeline:
   with self.db.transaction():
    self.db.execute("delete from cues where project_id=?",(pid,))
    self.db.conn.executemany("insert into cues(project_id,idx,start_ms,end_ms,text) values(?,?,?,?,?)",[(pid,i,s,e,t) for i,(s,e,t) in enumerate(rows,1)])
-   self.event(pid,"SRT_IMPORTED")
+   self._event(pid,"SRT_IMPORTED")
  def import_document(self,pid,kind,source,role=Role.OPERATOR,remote=None):
   self._role(role,'import'); self._active(pid); normalized=normalize_document(kind,source,remote)
   with self.db.conn:
@@ -63,7 +69,7 @@ class Pipeline:
  def plan_scenes(self,pid,special_codes=(),role=Role.OPERATOR):
   self._role(role,'plan'); project=self.db.one("select * from projects where id=?",(pid,)); audio=self.db.one("select * from audio where project_id=?",(pid,)); cues=self.db.all("select * from cues where project_id=? order by idx",(pid,))
   try: validate_timing(audio['duration_ms'] if audio else 0,[(x['start_ms'],x['end_ms'],x['text']) for x in cues])
-  except Exception as e: self.db.execute("update projects set state='BLOCKED',blocked_reason=? where id=?",(str(e),pid)); self.event(pid,"TIMING_BLOCKED",{"error":str(e)}); raise
+  except Exception as e: self.db.execute("update projects set state='BLOCKED',blocked_reason=? where id=?",(str(e),pid)); self._event(pid,"TIMING_BLOCKED",{"error":str(e)}); raise
   # Semantic boundaries are cue boundaries, subdivided according to DurationPolicy.
   planned=[]
   for c in cues:
@@ -83,7 +89,7 @@ class Pipeline:
    for i,(s,e,text,exc) in enumerate(planned,1):
     code=f"S{i:03d}"; special=code in special_codes; gate=required_approval(code,special)
     self.db.execute("insert into scenes(project_id,code,ord,start_ms,end_ms,text,special,state,approval_state,duration_exception) values(?,?,?,?,?,?,?,?,?,?)",(pid,code,i,s,e,text,special,"PLANNED","REQUIRED" if gate else "NOT_REQUIRED",exc))
-   self.event(pid,"SCENES_PLANNED",{"count":len(planned)}); self.checkpoint(pid,'plan',{'count':len(planned)},role)
+   self._event(pid,"SCENES_PLANNED",{"count":len(planned)}); self.checkpoint(pid,'plan',{'count':len(planned)},role)
   return [dict(x) for x in self.db.all("select * from scenes where project_id=? order by ord",(pid,))]
  def scene(self,sid): return dict(self.db.one("select * from scenes where id=?",(sid,)))
  def queue_retry(self,sid,role=Role.OPERATOR):
@@ -91,7 +97,7 @@ class Pipeline:
   if self.db.one('select count(*) n from attempts where scene_id=?',(sid,))['n']>=3: raise ValueError('maximum 3 attempts')
   with self.db.transaction():
    if self.db.execute("update scenes set state='RETRY_QUEUED' where id=? and state in ('RETRYABLE','BLOCKED')",(sid,)).rowcount!=1: raise PermissionError('illegal retry transition')
-   self.create_job(s['project_id'],f'RETRY_IMAGE:{sid}')
+   self._create_job(s['project_id'],f'RETRY_IMAGE:{sid}')
   return self.scene(sid)
  def record_image_attempt(self,sid,success,failed_binary=None,error=None,provider="codex-gpt-image-2",role=Role.OPERATOR):
   self._role(role,'retry')
@@ -110,7 +116,7 @@ class Pipeline:
   state="SUCCEEDED" if success else "FAILED"
   with self.db.transaction():
    self.db.execute("insert into attempts(scene_id,number,provider,state,error,failed_path,failed_sha256,failed_size,created_at) values(?,?,?,?,?,?,?,?,?)",(sid,n,provider,state,error,path,digest,size,now()))
-   self.db.execute("update scenes set state=?,checkpoint_json=? where id=?",("IMAGE_READY" if success else ("BLOCKED" if n==3 else "RETRYABLE"),json.dumps({'attempt':n}),sid)); self.event(scene['project_id'],"IMAGE_ATTEMPT",{"scene":scene['code'],"number":n,"state":state})
+   self.db.execute("update scenes set state=?,checkpoint_json=? where id=?",("IMAGE_READY" if success else ("BLOCKED" if n==3 else "RETRYABLE"),json.dumps({'attempt':n}),sid)); self._event(scene['project_id'],"IMAGE_ATTEMPT",{"scene":scene['code'],"number":n,"state":state})
   if path: Path(path).unlink(missing_ok=True)
  def record_scene_qa(self,sid,evidence,role=Role.REVIEWER):
   self._role(role,'approve')
@@ -131,7 +137,7 @@ class Pipeline:
  def start_batch(self,pid,role=Role.OPERATOR):
   self._role(role,'batch')
   if not self._pilot_ready(pid): raise PermissionError('pilot S001-S005 and special representatives require approval')
-  return self.create_job(pid,'BATCH_IMAGE')
+  return self._create_job(pid,'BATCH_IMAGE')
  def approve_post_batch(self,pid,ai_qa,contact_sheet,actor,role=Role.REVIEWER):
   self._role(role,'approve')
   if not self._planned_ready(pid): raise PermissionError('valid audio/SRT and at least one planned scene required')
@@ -146,12 +152,14 @@ class Pipeline:
   self._role(role,'animate')
   if not self._planned_ready(pid): raise PermissionError('valid audio/SRT and at least one planned scene required')
   if not self.db.one("select 1 from approvals where project_id=? and gate='POST_BATCH' and decision='APPROVED'",(pid,)): raise PermissionError('post-batch human approval required')
-  return self.create_job(pid,'ANIMATION')
+  return self._create_job(pid,'ANIMATION')
  def _active(self,pid):
   p=self.db.one('select state from projects where id=?',(pid,))
   if not p or p['state']!='ACTIVE': raise PermissionError('project is not active')
- def create_job(self,pid,kind):
+ def _create_job(self,pid,kind):
   self._active(pid); t=now(); return self.db.execute("insert into jobs(project_id,kind,state,created_at,updated_at) values(?,?,?,?,?)",(pid,kind,'QUEUED',t,t)).lastrowid
+ def create_job(self,*args,**kwargs):
+  raise PermissionError('jobs must be created through a gated workflow')
  def pause_job(self,jid,role=Role.OPERATOR):
   self._role(role,'pause')
   if self.db.execute("update jobs set state='PAUSED',updated_at=? where id=? and state in ('QUEUED','RUNNING')",(now(),jid)).rowcount!=1: raise PermissionError('illegal job pause transition')
@@ -181,7 +189,7 @@ class Pipeline:
   return [self.scene(s) for s in scene_ids]
  def checkpoint(self,pid,stage,data,role=Role.OPERATOR):
   self._role(role,'checkpoint-list')
-  job=self.db.one("select * from jobs where project_id=? order by id desc",(pid,)); jid=job['id'] if job else self.create_job(pid,'PIPELINE')
+  job=self.db.one("select * from jobs where project_id=? order by id desc",(pid,)); jid=job['id'] if job else self._create_job(pid,'PIPELINE')
   snapshot={**data,'data':data,'project':dict(self.db.one('select * from projects where id=?',(pid,))),'job':dict(self.db.one('select * from jobs where id=?',(jid,))),'scenes':[dict(x) for x in self.db.all('select * from scenes where project_id=?',(pid,))]}
   self.db.execute("insert into stages(job_id,name,state,checkpoint_json) values(?,?,?,?) on conflict(job_id,name) do update set state=excluded.state,checkpoint_json=excluded.checkpoint_json",(jid,stage,'SUCCEEDED',json.dumps(snapshot)))
  def propose_rerun(self,pid,stage,role=Role.OPERATOR): self._role(role,'retry'); return self.db.execute("insert into proposals(project_id,stage,state,created_at) values(?,?,?,?)",(pid,stage,'PROPOSED',now())).lastrowid
@@ -202,21 +210,29 @@ class Pipeline:
     if a['kind'].lower() in downstream:self.db.execute("update artifacts set status='SUPERSEDED' where id=?",(a['id'],))
    self.db.execute("update projects set version=version+1 where id=?",(p['project_id'],))
    if self.db.execute("update proposals set state='APPLIED' where id=? and state='APPROVED'",(i,)).rowcount!=1: raise PermissionError('rerun already applied')
-   return self.create_job(p['project_id'],'RERUN:'+stage)
+   return self._create_job(p['project_id'],'RERUN:'+stage)
  def add_artifact(self,pid,kind,uri,scene_id=None,parent_id=None,role=Role.OPERATOR):
   self._role(role,'scene-replace'); source=Path(uri).resolve(strict=True); root=self._root(pid)
   # Ingest into owned storage; callers' arbitrary source URI is never later deleted.
+  copied=False
   try: source.relative_to(root); managed=source
   except ValueError:
-   managed=root/(uuid.uuid4().hex+source.suffix); shutil.copyfile(source,managed)
-  digest,_=self._hash(managed); version=self.db.one("select coalesce(max(version),0)+1 v from artifacts where project_id=? and kind=? and scene_id is ?",(pid,kind,scene_id))['v']; days=self.db.one('select retention_days from projects where id=?',(pid,))['retention_days']; expires=(datetime.now(timezone.utc)+timedelta(days=days)).isoformat()
-  return self.db.execute("insert into artifacts(project_id,scene_id,kind,uri,sha256,version,parent_id,status,created_at,expires_at) values(?,?,?,?,?,?,?,?,?,?)",(pid,scene_id,kind,str(managed),digest,version,parent_id,"ACTIVE",now(),expires)).lastrowid
+   managed=root/(uuid.uuid4().hex+source.suffix); shutil.copyfile(source,managed); copied=True
+  try:
+   digest,_=self._hash(managed); version=self.db.one("select coalesce(max(version),0)+1 v from artifacts where project_id=? and kind=? and scene_id is ?",(pid,kind,scene_id))['v']; days=self.db.one('select retention_days from projects where id=?',(pid,))['retention_days']; expires=(datetime.now(timezone.utc)+timedelta(days=days)).isoformat()
+   with self.db.transaction():
+    aid=self.db.execute("insert into artifacts(project_id,scene_id,kind,uri,sha256,version,parent_id,status,created_at,expires_at) values(?,?,?,?,?,?,?,?,?,?)",(pid,scene_id,kind,str(managed),digest,version,parent_id,"ACTIVE",now(),expires)).lastrowid
+    self._event(pid,'ARTIFACT_ADDED',{'artifact':aid,'kind':kind})
+   return aid
+  except Exception:
+   if copied: managed.unlink(missing_ok=True)
+   raise
  def restore_artifact(self,artifact_id,role=Role.OPERATOR):
   self._role(role,'checkpoint-list')
   a=self.db.one('select * from artifacts where id=?',(artifact_id,))
   if not a or a['status']=='DELETED' or not os.path.isfile(a['uri']): raise FileNotFoundError('artifact binary unavailable')
   with self.db.transaction():
-   self.db.execute('update projects set version=version+1,state=\'ACTIVE\' where id=?',(a['project_id'],)); self.event(a['project_id'],'ARTIFACT_RESTORED',{'artifact':artifact_id})
+   self.db.execute('update projects set version=version+1,state=\'ACTIVE\' where id=?',(a['project_id'],)); self._event(a['project_id'],'ARTIFACT_RESTORED',{'artifact':artifact_id})
   return dict(a)
  def cleanup(self,role=Role.OWNER):
   self._role(role,'cleanup')
@@ -244,6 +260,33 @@ class Pipeline:
   if decision not in ('APPROVED','REJECTED'): raise ValueError('decision')
   with self.db.transaction():
    self.db.execute("update scenes set approval_state=? where id=?",(decision,s['id'])); self.db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at) values(?,?,?,?,?,?)",(pid,s['id'],"SCENE",decision,actor,now()))
+ def cancel_project(self,pid,role=Role.OWNER):
+  self._role(role,'project-cancel')
+  if self.db.execute("update projects set state='COMPLETED' where id=? and state!='COMPLETED'",(pid,)).rowcount!=1: raise PermissionError('project cannot be cancelled')
+ def select_provider(self,pid,provider,role=Role.OPERATOR):
+  self._role(role,'provider-select'); self._active(pid)
+  if not provider.strip(): raise ValueError('provider required')
+  self.db.execute('update projects set image_provider=? where id=?',(provider,pid))
+ def select_preset(self,pid,preset,role=Role.OPERATOR):
+  self._role(role,'preset-select'); self._active(pid); presets={'youtube':OutputConfig(),'presentation':OutputConfig(fps=30)}
+  if preset not in presets: raise ValueError('unknown preset')
+  self.db.execute('update projects set output_json=? where id=?',(json.dumps(presets[preset].__dict__),pid))
+ def configure_project(self,pid,key,value,role=Role.OWNER):
+  self._role(role,'project-config'); self._active(pid); columns={'whiteboard_mode','transition','language'}
+  if key not in columns: raise ValueError('unsupported configuration key')
+  self.db.execute(f'update projects set {key}=? where id=?',(value,pid))
+ def decide_gate(self,pid,gate,decision,actor,role=Role.REVIEWER):
+  command='approve' if decision=='APPROVED' else 'reject'; self._role(role,command)
+  if gate not in {'PILOT','BATCH','FINAL'} or decision not in {'APPROVED','REJECTED'}: raise ValueError('unsupported gate decision')
+  self.db.execute("insert into approvals(project_id,gate,decision,actor,created_at) values(?,?,?,?,?)",(pid,gate,decision,actor,now()))
+ def replace_scene_artifact(self,sid,uri,role=Role.OPERATOR):
+  self._role(role,'scene-replace'); s=self.scene(int(sid)); self._active(s['project_id'])
+  with self.db.transaction():
+   old=self.db.one("select * from artifacts where scene_id=? and kind='IMAGE' and status='ACTIVE' order by version desc",(s['id'],))
+   if old:self.db.execute("update artifacts set status='SUPERSEDED' where id=?",(old['id'],))
+   aid=self.add_artifact(s['project_id'],'IMAGE',uri,s['id'],old['id'] if old else None,role)
+   self._event(s['project_id'],'SCENE_ARTIFACT_REPLACED',{'scene':s['code'],'artifact':aid})
+  return aid
  def dispatch_discord(self,text,role):
   c=parse_discord(text); self._role(role,c.name)
   legacy={'approve':'scene-approve','reject':'scene-reject','pause':'project-pause','resume':'project-resume','retry':'scene-retry','status':'project-status'}
@@ -258,7 +301,7 @@ class Pipeline:
    if c.name in ('project-status','scene-status'): return self.status(a[0],role) if c.name=='project-status' else dict(self.db.one('select * from scenes where project_id=? and code=?',a))
    if c.name=='project-pause': self.pause(a[0],role)
    elif c.name in ('project-start','project-resume'): self.resume(a[0],role)
-   elif c.name=='project-cancel': self.db.execute("update projects set state='COMPLETED' where id=?",(a[0],))
+   elif c.name=='project-cancel': self.cancel_project(a[0],role)
    elif c.name=='import': return {'normalized':self.import_document(a[0],'text',a[1],role)}
    elif c.name=='plan': return self.plan_scenes(a[0],role=role)
    elif c.name=='scene-retry': return self.queue_retry(int(a[0]),role)
@@ -270,21 +313,12 @@ class Pipeline:
    elif c.name=='dependency-propose': return {'proposal_id':self.propose_dependency(a[0],a[1],{'impact':a[2]},role=role)}
    elif c.name=='dependency-approve': self.decide_dependency(int(a[0]),True,'discord',role)
    elif c.name=='dependency-apply': self.apply_dependency(int(a[0]),role)
-   elif c.name=='provider-select': self._active(a[0]); self.db.execute('update projects set image_provider=? where id=?',(a[1],a[0]))
-   elif c.name=='preset-select':
-    presets={'youtube':OutputConfig(),'presentation':OutputConfig(fps=30)}
-    if a[1] not in presets: raise ValueError('unknown preset')
-    self.db.execute('update projects set output_json=? where id=?',(json.dumps(presets[a[1]].__dict__),a[0]))
-   elif c.name=='project-config':
-    columns={'whiteboard_mode','transition','language'}
-    if a[1] not in columns: raise ValueError('unsupported configuration key')
-    self.db.execute(f'update projects set {a[1]}=? where id=?',(a[2],a[0]))
-   elif c.name in ('cost-report','error-report'): return self.report(a[0])['costs' if c.name=='cost-report' else 'errors']
-   elif c.name.endswith(('approve','reject')): self.db.execute("insert into approvals(project_id,gate,decision,actor,created_at) values(?,?,?,?,?)",(a[0],c.name.split('-')[0].upper(),'APPROVED' if c.name.endswith('approve') else 'REJECTED','discord',now()))
-   elif c.name=='scene-replace':
-    s=self.scene(int(a[0])); old=self.db.one("select * from artifacts where scene_id=? and kind='IMAGE' and status='ACTIVE' order by version desc",(s['id'],))
-    if old:self.db.execute("update artifacts set status='SUPERSEDED' where id=?",(old['id'],))
-    return {'artifact_id':self.add_artifact(s['project_id'],'IMAGE',a[1],s['id'],old['id'] if old else None)}
+   elif c.name=='provider-select': self.select_provider(a[0],a[1],role)
+   elif c.name=='preset-select': self.select_preset(a[0],a[1],role)
+   elif c.name=='project-config': self.configure_project(a[0],a[1],a[2],role)
+   elif c.name in ('cost-report','error-report'): return self.report(a[0],role)['costs' if c.name=='cost-report' else 'errors']
+   elif c.name.endswith(('approve','reject')): self.decide_gate(a[0],c.name.split('-')[0].upper(),'APPROVED' if c.name.endswith('approve') else 'REJECTED','discord',role)
+   elif c.name=='scene-replace': return {'artifact_id':self.replace_scene_artifact(int(a[0]),a[1],role)}
    return {'ok':True}
   except (ValueError,TypeError) as e:
    if isinstance(e,CommandError): raise
@@ -317,7 +351,7 @@ class Pipeline:
     if self.db.execute('update jobs set state=?,updated_at=? where id=? and project_id=?',(j['state'],now(),j['id'],pid)).rowcount!=1: raise ValueError('checkpoint job missing')
     for s in snap['scenes']:
      if self.db.execute('update scenes set state=?,approval_state=?,qa_state=?,qa_json=?,checkpoint_json=? where id=? and project_id=?',(s['state'],s['approval_state'],s['qa_state'],s.get('qa_json','{}'),s['checkpoint_json'],s['id'],pid)).rowcount!=1: raise ValueError('checkpoint scene missing')
-   self.event(pid,'CHECKPOINT_RESTORED',{'stage':stage})
+   self._event(pid,'CHECKPOINT_RESTORED',{'stage':stage})
   return dict(r)
  def observe_cost(self,pid,provider,currency,amount,role=Role.OPERATOR): self._role(role,'costs'); self.db.execute("insert into cost_observations(project_id,provider,currency,amount,created_at) values(?,?,?,?,?)",(pid,provider,currency,amount,now()))
  def propose_dependency(self,pid,dependency,impact,proposer="system",role=Role.OPERATOR): self._role(role,'dependency-propose'); return self.db.execute("insert into impact_proposals(project_id,dependency,impact_json,state,proposer,created_at) values(?,?,?,?,?,?)",(pid,dependency,json.dumps(impact),"PROPOSED",proposer,now())).lastrowid
@@ -328,15 +362,21 @@ class Pipeline:
   self._role(role,'dependency')
   p=self.db.one("select * from impact_proposals where id=?",(i,))
   if not p or p['state']!='APPROVED': raise PermissionError('approval required')
-  self.db.execute("update impact_proposals set state='APPLIED',applied_at=? where id=?",(now(),i)); self.event(p['project_id'],"DEPENDENCY_APPLIED",{"dependency":p['dependency']})
+  with self.db.transaction():
+   if self.db.execute("update impact_proposals set state='APPLIED',applied_at=? where id=? and state='APPROVED'",(now(),i)).rowcount!=1: raise PermissionError('dependency already applied')
+   self._event(p['project_id'],"DEPENDENCY_APPLIED",{"dependency":p['dependency']})
  def pause(self,pid,role=Role.OPERATOR):
   self._role(role,'pause')
   with self.db.transaction():
    if self.db.execute("update projects set state='PAUSED' where id=? and state='ACTIVE'",(pid,)).rowcount!=1: raise PermissionError('only ACTIVE projects can pause')
-   self.event(pid,"PAUSED")
+   self._event(pid,"PAUSED")
  def resume(self,pid,role=Role.OPERATOR):
   self._role(role,'resume'); p=self.db.one('select * from projects where id=?',(pid,))
   if not p or p['state']!='PAUSED': raise PermissionError('only PAUSED projects can resume')
-  self.db.execute("update projects set state='ACTIVE' where id=?",(pid,)); self.event(pid,"RESUMED")
+  with self.db.transaction():
+   if self.db.execute("update projects set state='ACTIVE' where id=? and state='PAUSED'",(pid,)).rowcount!=1: raise PermissionError('only PAUSED projects can resume')
+   self._event(pid,"RESUMED")
  def status(self,pid,role=Role.OPERATOR): self._role(role,'status'); return {"project":dict(self.db.one("select * from projects where id=?",(pid,))),"scenes":[dict(x) for x in self.db.all("select * from scenes where project_id=? order by ord",(pid,))],"jobs":[dict(x) for x in self.db.all('select * from jobs where project_id=?',(pid,))]}
- def report(self,pid): return {"costs":[dict(x) for x in self.db.all("select * from cost_observations where project_id=?",(pid,))],"errors":[dict(x) for x in self.db.all("select * from events where project_id=? and (type like '%BLOCKED' or data_json like '%error%')",(pid,))]}
+ def report(self,pid,role=Role.OPERATOR):
+  self._role(role,'cost-report')
+  return {"costs":[dict(x) for x in self.db.all("select * from cost_observations where project_id=?",(pid,))],"errors":[dict(x) for x in self.db.all("select * from events where project_id=? and (type like '%BLOCKED' or data_json like '%error%')",(pid,))]}
