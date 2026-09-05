@@ -2,7 +2,7 @@ import sqlite3,pytest
 from du_pipeline.db import Database
 from du_pipeline.service import Pipeline
 from du_pipeline.adapters import Role
-from du_pipeline.contracts import OutputConfig
+from du_pipeline.contracts import OutputConfig,QAEvidence
 from du_pipeline.inputs import normalize_text,narrator_metadata,normalize_document
 from du_pipeline.policies import ResourceScheduler
 
@@ -13,13 +13,13 @@ def test_gates_retry_checkpoints_and_rerun(tmp_path):
  d,p,pid,scenes=project(tmp_path)
  with pytest.raises(PermissionError): p.start_batch(pid)
  for s in scenes:
-  p.record_image_attempt(s['id'],True); p.record_scene_qa(s['id'],True); p.decide_scene(pid,s['code'],'APPROVED','r')
+  p.record_image_attempt(s['id'],True); p.record_scene_qa(s['id'],QAEvidence({'composition':True},1,'fake')); p.decide_scene(pid,s['code'],'APPROVED','r')
  assert p.start_batch(pid)
  with pytest.raises(PermissionError):p.start_animation(pid)
  with pytest.raises(ValueError):p.approve_post_batch(pid,False,'sheet','r')
  sheet=tmp_path/'sheet.png'; sheet.write_bytes(b'sheet')
- p.approve_post_batch(pid,True,str(sheet),'r'); assert p.start_animation(pid)
- p.record_image_attempt(scenes[0]['id'],False,error='x'); before=d.one('select count(*) n from attempts')['n']; p.queue_retry(scenes[0]['id']); assert d.one('select count(*) n from attempts')['n']==before
+ p.approve_post_batch(pid,QAEvidence({'contact_sheet':True},1,'fake'),str(sheet),'r'); assert p.start_animation(pid)
+ with pytest.raises(PermissionError): p.record_image_attempt(scenes[0]['id'],False,error='x')
  proposal=p.propose_rerun(pid,'plan');
  with pytest.raises(PermissionError):p.apply_rerun(proposal)
  p.decide_rerun(proposal,True,'owner'); assert p.apply_rerun(proposal)

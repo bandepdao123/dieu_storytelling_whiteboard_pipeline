@@ -30,7 +30,7 @@ def main(argv=None):
  elif a.cmd=='resume': svc.resume(a.project_id,a.role); result={'state':'ACTIVE'}
  elif a.cmd=='import-audio': svc.import_audio(a.project_id,a.uri,a.duration_ms,a.sha256,a.role); result={'imported':'audio'}
  elif a.cmd=='import-srt': svc.import_srt(a.project_id,srt(a.path),a.role); result={'imported':'srt'}
- elif a.cmd=='import-script': svc.event(a.project_id,'SCRIPT_SOURCE_IMPORTED',{'kind':a.kind,'source':a.source}); result={'normalized_metadata':True}
+ elif a.cmd=='import-script': result={'normalized':svc.import_document(a.project_id,a.kind,a.source,a.role)}
  elif a.cmd=='plan': result={'scenes':svc.plan_scenes(a.project_id,role=a.role)}
  elif a.cmd=='retry': svc.queue_retry(a.scene_id,a.role); result={'scene_id':a.scene_id,'state':'RETRY_QUEUED'}
  elif a.cmd in ('approve','reject'): svc.decide_scene(a.project_id,a.scene_code,'APPROVED' if a.cmd=='approve' else 'REJECTED',a.actor,a.role); result={'decision':a.cmd}

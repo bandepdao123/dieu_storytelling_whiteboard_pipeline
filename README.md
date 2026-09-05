@@ -40,3 +40,10 @@ du-pipeline --db demo.db report PROJECT_ID
 Audio là đồng hồ chuẩn. Cue rỗng, overlap, ngoài audio hoặc lệch điểm cuối >500ms sẽ BLOCKED, không tự căn chỉnh. S001–S005 và scene special cần duyệt. Image attempt tối đa 3; chỉ scene đó BLOCKED. Binary lỗi bị xóa ngay, metadata attempt còn; artifact thường có TTL 3 ngày. SQLite là source of truth; Sheet 11 tab và Drive folders là contract. Provider image/animation là Protocol plugin.
 
 Metadata output mặc định mô tả 1920x1080, 30fps, 16:9 H.264 MP4; hard cut, không music/sub/logo, final hold 1–2s nằm trong duration. Core local đã có dispatcher `du-*` không dấu với schema/RBAC, checkpoint stage, restore latest, rerun có approval + invalidation/version, duration exception và cleanup idempotent bảo vệ dữ liệu bất biến. Render thực tế, contact-sheet image synthesis, AI-QA model invocation, cloud/Discord network adapters và ultimate precision **chưa live**, thuộc phase sau.
+# Phase 1 boundary
+
+The repository provides a deterministic, local fake/dry-run orchestration core with
+SQLite persistence, typed QA evidence, approval gates, bounded scheduling and
+checkpoint snapshots. Google/Discord/provider network integrations and the
+precision whiteboard rendering engine are intentionally **not implemented**;
+adapters remain local contracts/fakes and no claim of production media fidelity is made.

@@ -36,6 +36,14 @@ class Bible:
 class ContactSheetArtifact:
  id:int; project_id:str; uri:str; sha256:str; version:int; status:str
 @dataclass(frozen=True)
+class QAEvidence:
+ checks:Mapping[str,bool]; score:float; evaluator:str
+ def __post_init__(self):
+  if not self.checks or any(type(v) is not bool for v in self.checks.values()): raise ValueError('typed QA checks required')
+  if not 0<=self.score<=1 or not self.evaluator.strip(): raise ValueError('invalid QA evidence')
+ @property
+ def passed(self): return all(self.checks.values()) and self.score>=0.8
+@dataclass(frozen=True)
 class OutputConfig:
  width:int=1920; height:int=1080; fps:int=30; aspect_ratio:str='16:9'; codec:str='H264'; container:str='MP4'; pixel_format:str='yuv420p'; music:bool=False; subtitles:bool=False; srt:bool=False; logo:bool=False; final_hold_seconds:float=1.5; transition:str='hard_cut'
  def __post_init__(self):
