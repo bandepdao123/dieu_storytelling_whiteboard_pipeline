@@ -65,20 +65,23 @@ class SheetsAdapter:
 
 class DriveAdapter:
     """Fake-friendly resumable client boundary."""
-    def __init__(self,client,root_id=None,chunk_size=1048576):self.client=client;self.root_id=root_id or os.getenv("DU_GOOGLE_DRIVE_ROOT_ID",DEFAULT_DRIVE_ROOT);self.chunk_size=chunk_size
+    def __init__(self,client,root_id=None,chunk_size=1048576,sleep=time.sleep):self.client=client;self.root_id=root_id or os.getenv("DU_GOOGLE_DRIVE_ROOT_ID",DEFAULT_DRIVE_ROOT);self.chunk_size=chunk_size;self.sleep=sleep
     def ensure_tree(self,pid,dry_run=False):
         if dry_run:return {x:None for x in DRIVE}
-        root=self.client.ensure_folder(self.root_id,pid);return {x:self.client.ensure_folder(root,x) for x in DRIVE}
+        root=retry_call(lambda:self.client.ensure_folder(self.root_id,pid),sleep=self.sleep);return {x:retry_call(lambda n=x:self.client.ensure_folder(root,n),sleep=self.sleep) for x in DRIVE}
     def upload(self,pid,local_path,folder="07_exports",manifest_path=None,dry_run=False):
         path=Path(local_path);size=path.stat().st_size;digest=hashlib.sha256(path.read_bytes()).hexdigest()
         if dry_run:return {"dry_run":True,"path":str(path),"size":size,"sha256":digest}
-        folders=self.ensure_tree(pid);session,offset=self.client.begin_upload(folders[folder],path.name,size,digest)
+        folders=self.ensure_tree(pid);session,offset=retry_call(lambda:self.client.begin_upload(folders[folder],path.name,size,digest),sleep=self.sleep)
         with path.open("rb") as stream:
             stream.seek(offset)
-            while offset<size:offset=self.client.upload_chunk(session,offset,stream.read(self.chunk_size))
-        rid=self.client.finish_upload(session);meta=self.client.metadata(rid)
-        if meta.get("size") is not None and int(meta["size"])!=size:raise VerificationError("remote size mismatch")
+            while offset<size:
+                chunk=stream.read(self.chunk_size);offset=retry_call(lambda o=offset,c=chunk:self.client.upload_chunk(session,o,c),sleep=self.sleep)
+        rid=retry_call(lambda:self.client.finish_upload(session),sleep=self.sleep);meta=retry_call(lambda:self.client.metadata(rid),sleep=self.sleep)
+        if meta.get("size") is None:raise VerificationError("remote size evidence missing")
+        if int(meta["size"])!=size:raise VerificationError("remote size mismatch")
         if meta.get("sha256") is not None and meta["sha256"].lower()!=digest:raise VerificationError("remote checksum mismatch")
+        if meta.get('sha256') is None and not (meta.get('checksum_supported') is False and (meta.get('etag') or meta.get('version'))):raise VerificationError("remote checksum unavailable without strong alternative evidence")
         result={"local_path":str(path),"remote_id":rid,"size":size,"sha256":digest,"verified":True}
         target=Path(manifest_path or path.parent/"upload-manifest.json"); old=json.loads(target.read_text()) if target.exists() else []
         target.write_text(json.dumps([x for x in old if x.get("local_path")!=str(path)]+[result],indent=2),encoding="utf8");return result
@@ -86,17 +89,34 @@ class DriveAdapter:
 class DiscordBridge:
     def __init__(self,pipeline,allowlist):self.pipeline,self.allowlist=pipeline,allowlist
     def dispatch(self,message_id,user_id,text,dry_run=False):
-        if user_id not in self.allowlist:return {"type":"TU_CHOI","ok":False,"message":"Bạn không có quyền sử dụng bot."}
-        if not text.strip().startswith("du-"):return {"type":"BO_QUA","ok":False,"message":"Chỉ chấp nhận lệnh du-*."}
+        from .adapters import parse_discord,authorize,CommandError
+        from .service import now
+        def audit(outcome,detail):
+            self.pipeline.db.execute('insert into integration_attempts(source,external_id,user_id,outcome,detail,created_at) values(?,?,?,?,?,?)',('DISCORD',message_id,user_id,outcome,detail,now()))
+        if user_id not in self.allowlist:
+            audit('DENIED','unauthorized');return {"type":"TU_CHOI","ok":False,"message":"Bạn không có quyền sử dụng bot."}
         old=self.pipeline.db.one("select response_json from discord_messages where message_id=?",(message_id,))
-        if old:return json.loads(old[0])
-        if dry_run:return {"type":"DRY_RUN","ok":True,"message":"Lệnh hợp lệ; chưa thực thi."}
+        if old:
+            audit('REPLAY','reserved');return json.loads(old[0]) if old[0] else {"type":"DANG_XU_LY","ok":False,"message":"Lệnh đang xử lý hoặc cần đối soát."}
+        try:
+            command=parse_discord(text)
+            if not authorize(Role(self.allowlist[user_id]),command.name):
+                audit('DENIED','rbac');return {"type":"TU_CHOI","ok":False,"message":"Vai trò không được phép thực hiện lệnh này."}
+        except CommandError as exc:
+            audit('INVALID',exc.code);return {"type":"LOI_LENH","ok":False,"message":str(exc)}
+        old=self.pipeline.db.one("select response_json from discord_messages where message_id=?",(message_id,))
+        if old:
+            audit('REPLAY','reserved');return json.loads(old[0]) if old[0] else {"type":"DANG_XU_LY","ok":False,"message":"Lệnh đang xử lý hoặc cần đối soát."}
+        if dry_run:
+            audit('DRY_RUN','validated');return {"type":"DRY_RUN","ok":True,"message":"Lệnh hợp lệ và được phép; chưa thực thi."}
+        try:self.pipeline.db.execute("insert into discord_messages(message_id,user_id,response_json,created_at,state) values(?,?,NULL,?,'PROCESSING')",(message_id,user_id,now()))
+        except Exception:
+            old=self.pipeline.db.one("select response_json from discord_messages where message_id=?",(message_id,));return json.loads(old[0]) if old and old[0] else {"type":"DANG_XU_LY","ok":False,"message":"Lệnh đang xử lý."}
         try:r={"type":"THANH_CONG","ok":True,"message":"Đã thực thi lệnh.","data":self.pipeline.dispatch_discord(text,Role(self.allowlist[user_id]))}
         except PermissionError:r={"type":"TU_CHOI","ok":False,"message":"Vai trò không được phép thực hiện lệnh này."}
-        except Exception as exc:r={"type":"LOI_LENH","ok":False,"message":str(exc)}
+        except Exception as exc:r={"type":"LOI_LENH","ok":False,"message":type(exc).__name__}
         with self.pipeline.db.transaction():
-            from .service import now
-            self.pipeline.db.execute("insert into discord_messages values(?,?,?,?)",(message_id,user_id,json.dumps(r),now()))
+            self.pipeline.db.execute("update discord_messages set response_json=?,state=?,error=? where message_id=?",(json.dumps(r),'COMPLETED' if r['ok'] else 'FAILED',None if r['ok'] else r['type'],message_id))
             pid=(r.get("data") or {}).get("project_id")
             if pid:self.pipeline._event(pid,"DISCORD_COMMAND",{"message_id":message_id,"user_id":user_id})
-        return r
+        audit('COMPLETED' if r['ok'] else 'FAILED',r['type']);return r

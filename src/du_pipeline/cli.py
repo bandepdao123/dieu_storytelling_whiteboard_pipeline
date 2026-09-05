@@ -1,4 +1,4 @@
-import argparse,json,re,sys
+import argparse,json,re,sys,os,importlib
 from .db import Database
 from .service import Pipeline
 
@@ -31,7 +31,13 @@ def parser():
 def integration_client(kind):
  from .integrations import require_oauth_path,IntegrationConfigurationError
  require_oauth_path()
- raise IntegrationConfigurationError(f'{kind} client factory must be configured by the deployment plugin')
+ spec=os.environ.get('DU_INTEGRATION_CLIENT_FACTORY')
+ if not spec: raise IntegrationConfigurationError('DU_INTEGRATION_CLIENT_FACTORY (module:callable) is required')
+ try:
+  module,name=spec.split(':',1); client=getattr(importlib.import_module(module),name)(kind)
+ except Exception as exc: raise IntegrationConfigurationError(f'cannot load integration client factory {spec!r}: {exc}') from exc
+ if client is None: raise IntegrationConfigurationError(f'factory did not provide a {kind} client')
+ return client
 def main(argv=None):
  a=parser().parse_args(argv); svc=Pipeline(Database(a.db)); result={}
  if a.cmd=='init': result={'project_id':svc.init_project(a.name,a.language,a.seed,json.loads(a.style),json.loads(a.references),role=a.role)}
