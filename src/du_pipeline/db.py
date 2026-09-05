@@ -2,7 +2,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 class SchemaVersionError(RuntimeError): pass
 
@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,project_id TEXT NOT NUL
 CREATE TABLE IF NOT EXISTS cost_observations(id INTEGER PRIMARY KEY,project_id TEXT REFERENCES projects(id),provider TEXT,currency TEXT,amount TEXT,created_at TEXT);
 CREATE TABLE IF NOT EXISTS time_observations(id INTEGER PRIMARY KEY,project_id TEXT REFERENCES projects(id),stage TEXT,seconds REAL,created_at TEXT);
 CREATE TABLE IF NOT EXISTS learning_metadata(id INTEGER PRIMARY KEY,project_id TEXT REFERENCES projects(id),key TEXT,value_json TEXT,created_at TEXT);
+CREATE TABLE IF NOT EXISTS integration_projects(project_id TEXT PRIMARY KEY REFERENCES projects(id),spreadsheet_id TEXT);
+CREATE TABLE IF NOT EXISTS integration_commands(source TEXT,external_id TEXT,project_id TEXT REFERENCES projects(id),created_at TEXT,PRIMARY KEY(source,external_id));
+CREATE TABLE IF NOT EXISTS discord_messages(message_id TEXT PRIMARY KEY,user_id TEXT,response_json TEXT,created_at TEXT);
 '''
 APPEND=("events","cost_observations","time_observations","learning_metadata")
 class Database:
@@ -44,7 +47,7 @@ class Database:
      if statement.strip(): self.conn.execute(statement)
     self.conn.execute('PRAGMA user_version=1'); version=1
    # Explicit 1 -> 2 additive upgrade from the original schema; 2 is verified below.
-   if version not in (1,2): raise SchemaVersionError(f'unsupported schema version {version}')
+   if version not in (1,2,3): raise SchemaVersionError(f'unsupported schema version {version}')
    cols={r[1] for r in self.conn.execute('pragma table_info(projects)')}
    if version == 2 and 'artifact_root' not in cols: raise SchemaVersionError('schema version 2 does not match structure')
    additions=[('min_scenes','INTEGER NOT NULL DEFAULT 50'),('max_scenes','INTEGER NOT NULL DEFAULT 360'),('retention_days','INTEGER NOT NULL DEFAULT 3'),('output_json',"TEXT NOT NULL DEFAULT '{}'") ,('version','INTEGER NOT NULL DEFAULT 1'),('artifact_root','TEXT')]
@@ -56,6 +59,9 @@ class Database:
    for t in APPEND:
     self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS {t}_no_update BEFORE UPDATE ON {t} BEGIN SELECT RAISE(ABORT,'append only'); END")
     self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS {t}_no_delete BEFORE DELETE ON {t} BEGIN SELECT RAISE(ABORT,'append only'); END")
+   self.conn.execute('CREATE TABLE IF NOT EXISTS integration_projects(project_id TEXT PRIMARY KEY REFERENCES projects(id),spreadsheet_id TEXT)')
+   self.conn.execute('CREATE TABLE IF NOT EXISTS integration_commands(source TEXT,external_id TEXT,project_id TEXT REFERENCES projects(id),created_at TEXT,PRIMARY KEY(source,external_id))')
+   self.conn.execute('CREATE TABLE IF NOT EXISTS discord_messages(message_id TEXT PRIMARY KEY,user_id TEXT,response_json TEXT,created_at TEXT)')
    # Composite ownership safeguards without rebuilding legacy tables.
    ownership=(
     ('artifact_scene_project','artifacts',"NEW.scene_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM scenes WHERE id=NEW.scene_id AND project_id=NEW.project_id)",'cross-project scene'),

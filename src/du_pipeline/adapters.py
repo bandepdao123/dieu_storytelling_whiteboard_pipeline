@@ -1,7 +1,7 @@
 import shlex
 from dataclasses import dataclass
 from enum import Enum
-SHEET_TABS=("Projects","Jobs","Stages","Scenes","Attempts","Artifacts","Approvals","Events","Costs","Timings","Learnings")
+SHEET_TABS=("PROJECT","SCENES","CHARACTERS","ENVIRONMENTS","PROPS","ASSETS","GENERATIONS","QA","FEEDBACK","COST_TIME","LEARNINGS")
 DRIVE=("00_inputs","01_references","02_audio_srt","03_scenes","04_images","05_animation","06_qa","07_exports","99_failed_metadata")
 def drive_folders(pid): return tuple(f"{pid}/{x}" for x in DRIVE)
 class Role(str,Enum): OWNER="OWNER"; REVIEWER="REVIEWER"; OPERATOR="OPERATOR"
