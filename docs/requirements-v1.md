@@ -29,3 +29,24 @@ RBAC roles: OWNER, REVIEWER, OPERATOR. Google Sheet has exactly 11 prescribed ta
 
 ## Acceptance
 Python 3.11, minimal dependencies, CLI and automated unit/integration tests. Commands initialize, import metadata, plan, inspect, pause/resume, retry, approve/reject, and report cost/errors. No OpenMontage code is copied.
+# Frozen source-requirement coverage
+
+This frozen v1 contract requires: semantic 5–8 second scenes before minute 3 and
+10–20 second scenes thereafter; normally 50–360 scenes (explicit per-project
+fixture override only); deterministic project seed; S001–S005 and designated
+representatives approved before batch generation; AI QA, contact sheet, and
+human approval before animation. Retry is queued without inventing an attempt.
+Jobs, stages, scenes and attempts are checkpointed; reruns require proposals and
+approval; artifacts/project versions support restore/resume.
+
+Inputs are normalized text, local audio/SRT metadata, optional DOCX/XLSX readers,
+or Google Docs/URL adapters. Exactly one human narrator is metadata, while
+research/script providers are optional protocols. Strict style, character,
+environment, prop and time-state bibles and references attach to generation.
+Output is 1920x1080, 30 fps, 16:9 H264 MP4 yuv420p, no music/subtitles/SRT/logo,
+with a 1–2 second final hold inside narration duration and hard-cut default.
+Retention defaults to three days per project; cleanup preserves metadata and
+deletes binaries. SQLite enforces FK/check/state constraints. Discord `du-*`, CLI
+and service all enforce OWNER/REVIEWER/OPERATOR. Scheduling targets 4 CPU/3.8 GB
+using bounded image/animation/light semaphores. Integrations remain adapters and
+perform no provider/network side effects.

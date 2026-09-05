@@ -13,7 +13,7 @@ def srt(path):
   out.append((ms(a),ms(b),' '.join(lines[lines.index(timing)+1:])))
  return out
 def parser():
- p=argparse.ArgumentParser(); p.add_argument('--db',default='pipeline.db'); sub=p.add_subparsers(dest='cmd',required=True)
+ p=argparse.ArgumentParser(); p.add_argument('--db',default='pipeline.db'); p.add_argument('--role',choices=['OWNER','REVIEWER','OPERATOR'],default='OWNER'); sub=p.add_subparsers(dest='cmd',required=True)
  q=sub.add_parser('init'); q.add_argument('name'); q.add_argument('--language',default='vi'); q.add_argument('--seed',type=int,default=0); q.add_argument('--style',default='{}'); q.add_argument('--references',default='[]')
  for name in ('status','pause','resume','plan','report'): q=sub.add_parser(name); q.add_argument('project_id')
  q=sub.add_parser('import-audio'); q.add_argument('project_id'); q.add_argument('uri'); q.add_argument('duration_ms',type=int); q.add_argument('sha256')
@@ -24,16 +24,16 @@ def parser():
  return p
 def main(argv=None):
  a=parser().parse_args(argv); svc=Pipeline(Database(a.db)); result={}
- if a.cmd=='init': result={'project_id':svc.init_project(a.name,a.language,a.seed,json.loads(a.style),json.loads(a.references))}
- elif a.cmd=='status': result=svc.status(a.project_id)
- elif a.cmd=='pause': svc.pause(a.project_id); result={'state':'PAUSED'}
- elif a.cmd=='resume': svc.resume(a.project_id); result={'state':'ACTIVE'}
- elif a.cmd=='import-audio': svc.import_audio(a.project_id,a.uri,a.duration_ms,a.sha256); result={'imported':'audio'}
- elif a.cmd=='import-srt': svc.import_srt(a.project_id,srt(a.path)); result={'imported':'srt'}
+ if a.cmd=='init': result={'project_id':svc.init_project(a.name,a.language,a.seed,json.loads(a.style),json.loads(a.references),role=a.role)}
+ elif a.cmd=='status': result=svc.status(a.project_id,a.role)
+ elif a.cmd=='pause': svc.pause(a.project_id,a.role); result={'state':'PAUSED'}
+ elif a.cmd=='resume': svc.resume(a.project_id,a.role); result={'state':'ACTIVE'}
+ elif a.cmd=='import-audio': svc.import_audio(a.project_id,a.uri,a.duration_ms,a.sha256,a.role); result={'imported':'audio'}
+ elif a.cmd=='import-srt': svc.import_srt(a.project_id,srt(a.path),a.role); result={'imported':'srt'}
  elif a.cmd=='import-script': svc.event(a.project_id,'SCRIPT_SOURCE_IMPORTED',{'kind':a.kind,'source':a.source}); result={'normalized_metadata':True}
- elif a.cmd=='plan': result={'scenes':svc.plan_scenes(a.project_id)}
- elif a.cmd=='retry': svc.record_image_attempt(a.scene_id,False,error='manual retry queued'); result={'scene_id':a.scene_id}
- elif a.cmd in ('approve','reject'): svc.decide_scene(a.project_id,a.scene_code,'APPROVED' if a.cmd=='approve' else 'REJECTED',a.actor); result={'decision':a.cmd}
+ elif a.cmd=='plan': result={'scenes':svc.plan_scenes(a.project_id,role=a.role)}
+ elif a.cmd=='retry': svc.queue_retry(a.scene_id,a.role); result={'scene_id':a.scene_id,'state':'RETRY_QUEUED'}
+ elif a.cmd in ('approve','reject'): svc.decide_scene(a.project_id,a.scene_code,'APPROVED' if a.cmd=='approve' else 'REJECTED',a.actor,a.role); result={'decision':a.cmd}
  elif a.cmd=='report': result=svc.report(a.project_id)
  print(json.dumps(result,ensure_ascii=False)); return 0
 if __name__=='__main__': raise SystemExit(main())

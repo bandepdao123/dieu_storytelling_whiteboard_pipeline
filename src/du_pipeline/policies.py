@@ -26,3 +26,19 @@ def required_approval(code: str, special: bool): return special or int(code[1:])
 @dataclass(frozen=True)
 class SchedulerConfig:
     cpu_limit:int=4; memory_mb:int=3072; image_workers:int=1; animation_workers:int=1; light_workers:int=2; queue_size:int=8
+
+class ResourceScheduler:
+    """Side-effect-free admission policy; executors own actual processes."""
+    def __init__(self,config=SchedulerConfig()): self.config=config; self.running={"image":0,"animation":0,"light":0}; self.queued=[]
+    def submit(self,kind,item):
+        if kind not in self.running: raise ValueError('unknown resource class')
+        if len(self.queued)>=self.config.queue_size: raise OverflowError('scheduler queue full')
+        self.queued.append((kind,item))
+    def acquire(self):
+        limits={"image":self.config.image_workers,"animation":self.config.animation_workers,"light":self.config.light_workers}
+        for i,(kind,item) in enumerate(self.queued):
+            if self.running[kind]<limits[kind]: self.queued.pop(i); self.running[kind]+=1; return kind,item
+        return None
+    def release(self,kind):
+        if self.running.get(kind,0)<=0: raise ValueError('resource not acquired')
+        self.running[kind]-=1

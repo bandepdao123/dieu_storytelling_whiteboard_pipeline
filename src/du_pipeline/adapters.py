@@ -15,4 +15,4 @@ def parse_discord(text):
 def authorize(role, command):
     if role==Role.OWNER:return True
     if role==Role.REVIEWER:return command in {"approve","reject","status","costs","errors"}
-    return command in {"pause","resume","retry","status","costs","errors"}
+    return command in {"import","plan","batch","animate","pause","resume","retry","status","costs","errors"}

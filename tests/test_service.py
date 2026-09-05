@@ -7,7 +7,7 @@ from du_pipeline.service import Pipeline
 def test_project_plan_retry_audit_artifact_and_retention(tmp_path):
     db = Database(tmp_path / "x.db")
     p = Pipeline(db)
-    pid = p.init_project("Demo", "vi", seed=7)
+    pid = p.init_project("Demo", "vi", seed=7, scene_range=(1, 10))
     p.import_audio(pid, "audio.wav", 20_000, "a" * 64)
     p.import_srt(pid, [(0, 6_000, "mot"), (6_000, 12_000, "hai"), (12_000, 19_800, "ba")])
     scenes = p.plan_scenes(pid)
