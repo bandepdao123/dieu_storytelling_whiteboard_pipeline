@@ -38,9 +38,15 @@ class Database:
   if version>SCHEMA_VERSION: raise SchemaVersionError(f'unsupported schema version {version}')
   try:
    self.conn.execute('BEGIN IMMEDIATE')
-   self.conn.executescript(SCHEMA)
-   # Versioned, additive upgrade from the original schema (user_version 0/1).
+   # executescript commits implicitly; execute individual DDL so migration is atomic.
+   if version == 0:
+    for statement in SCHEMA.split(';'):
+     if statement.strip(): self.conn.execute(statement)
+    self.conn.execute('PRAGMA user_version=1'); version=1
+   # Explicit 1 -> 2 additive upgrade from the original schema; 2 is verified below.
+   if version not in (1,2): raise SchemaVersionError(f'unsupported schema version {version}')
    cols={r[1] for r in self.conn.execute('pragma table_info(projects)')}
+   if version == 2 and 'artifact_root' not in cols: raise SchemaVersionError('schema version 2 does not match structure')
    additions=[('min_scenes','INTEGER NOT NULL DEFAULT 50'),('max_scenes','INTEGER NOT NULL DEFAULT 360'),('retention_days','INTEGER NOT NULL DEFAULT 3'),('output_json',"TEXT NOT NULL DEFAULT '{}'") ,('version','INTEGER NOT NULL DEFAULT 1'),('artifact_root','TEXT')]
    for name,ddl in additions:
     if name not in cols:self.conn.execute(f'ALTER TABLE projects ADD COLUMN {name} {ddl}')
@@ -51,11 +57,13 @@ class Database:
     self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS {t}_no_update BEFORE UPDATE ON {t} BEGIN SELECT RAISE(ABORT,'append only'); END")
     self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS {t}_no_delete BEFORE DELETE ON {t} BEGIN SELECT RAISE(ABORT,'append only'); END")
    # Composite ownership safeguards without rebuilding legacy tables.
-   self.conn.executescript('''
-CREATE TRIGGER IF NOT EXISTS artifact_scene_project BEFORE INSERT ON artifacts WHEN NEW.scene_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM scenes WHERE id=NEW.scene_id AND project_id=NEW.project_id) BEGIN SELECT RAISE(ABORT,'cross-project scene'); END;
-CREATE TRIGGER IF NOT EXISTS artifact_parent_project BEFORE INSERT ON artifacts WHEN NEW.parent_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM artifacts WHERE id=NEW.parent_id AND project_id=NEW.project_id) BEGIN SELECT RAISE(ABORT,'cross-project parent'); END;
-CREATE TRIGGER IF NOT EXISTS approval_scene_project BEFORE INSERT ON approvals WHEN NEW.scene_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM scenes WHERE id=NEW.scene_id AND project_id=NEW.project_id) BEGIN SELECT RAISE(ABORT,'cross-project approval'); END;
-''')
+   ownership=(
+    ('artifact_scene_project','artifacts',"NEW.scene_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM scenes WHERE id=NEW.scene_id AND project_id=NEW.project_id)",'cross-project scene'),
+    ('artifact_parent_project','artifacts',"NEW.parent_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM artifacts WHERE id=NEW.parent_id AND project_id=NEW.project_id)",'cross-project parent'),
+    ('approval_scene_project','approvals',"NEW.scene_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM scenes WHERE id=NEW.scene_id AND project_id=NEW.project_id)",'cross-project approval'))
+   for name,table,condition,message in ownership:
+    for operation in ('INSERT','UPDATE'):
+     self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS {name}_{operation.lower()} BEFORE {operation} ON {table} WHEN {condition} BEGIN SELECT RAISE(ABORT,'{message}'); END")
    self.conn.execute(f'PRAGMA user_version={SCHEMA_VERSION}'); self.conn.commit()
   except Exception:
    self.conn.rollback(); raise

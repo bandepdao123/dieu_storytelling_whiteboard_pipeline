@@ -50,13 +50,10 @@ class Pipeline:
   # Validate the complete replacement before touching persisted cues.
   audio=self.db.one('select duration_ms from audio where project_id=?',(pid,))
   validate_timing(audio['duration_ms'] if audio else 0,rows)
-  try:
-   with self.db.conn:
-    self.db.conn.execute("delete from cues where project_id=?",(pid,))
-    self.db.conn.executemany("insert into cues(project_id,idx,start_ms,end_ms,text) values(?,?,?,?,?)",[(pid,i,s,e,t) for i,(s,e,t) in enumerate(rows,1)])
+  with self.db.transaction():
+   self.db.execute("delete from cues where project_id=?",(pid,))
+   self.db.conn.executemany("insert into cues(project_id,idx,start_ms,end_ms,text) values(?,?,?,?,?)",[(pid,i,s,e,t) for i,(s,e,t) in enumerate(rows,1)])
    self.event(pid,"SRT_IMPORTED")
-  except Exception:
-   self.db.conn.rollback(); raise
  def import_document(self,pid,kind,source,role=Role.OPERATOR,remote=None):
   self._role(role,'import'); self._active(pid); normalized=normalize_document(kind,source,remote)
   with self.db.conn:
@@ -81,17 +78,23 @@ class Pipeline:
      exc=None if lo*1000<=e-s<=hi*1000 else json.dumps({'reason':'unavoidable_semantic_unit','actual_ms':e-s,'target_min_ms':lo*1000,'target_max_ms':hi*1000})
      planned.append((s,e,c['text'],exc))
   if not project['min_scenes']<=len(planned)<=project['max_scenes']: raise ValueError(f"scene count {len(planned)} outside configured {project['min_scenes']}-{project['max_scenes']}")
-  self.db.execute("delete from scenes where project_id=?",(pid,))
-  for i,(s,e,text,exc) in enumerate(planned,1):
-   code=f"S{i:03d}"; special=code in special_codes; gate=required_approval(code,special)
-   self.db.execute("insert into scenes(project_id,code,ord,start_ms,end_ms,text,special,state,approval_state,duration_exception) values(?,?,?,?,?,?,?,?,?,?)",(pid,code,i,s,e,text,special,"PLANNED","REQUIRED" if gate else "NOT_REQUIRED",exc))
-  self.event(pid,"SCENES_PLANNED",{"count":len(planned)}); self.checkpoint(pid,'plan',{'count':len(planned)}); return [dict(x) for x in self.db.all("select * from scenes where project_id=? order by ord",(pid,))]
+  with self.db.transaction():
+   self.db.execute("delete from scenes where project_id=?",(pid,))
+   for i,(s,e,text,exc) in enumerate(planned,1):
+    code=f"S{i:03d}"; special=code in special_codes; gate=required_approval(code,special)
+    self.db.execute("insert into scenes(project_id,code,ord,start_ms,end_ms,text,special,state,approval_state,duration_exception) values(?,?,?,?,?,?,?,?,?,?)",(pid,code,i,s,e,text,special,"PLANNED","REQUIRED" if gate else "NOT_REQUIRED",exc))
+   self.event(pid,"SCENES_PLANNED",{"count":len(planned)}); self.checkpoint(pid,'plan',{'count':len(planned)},role)
+  return [dict(x) for x in self.db.all("select * from scenes where project_id=? order by ord",(pid,))]
  def scene(self,sid): return dict(self.db.one("select * from scenes where id=?",(sid,)))
  def queue_retry(self,sid,role=Role.OPERATOR):
   self._role(role,'retry'); s=self.db.one('select * from scenes where id=?',(sid,)); self._active(s['project_id'])
   if self.db.one('select count(*) n from attempts where scene_id=?',(sid,))['n']>=3: raise ValueError('maximum 3 attempts')
-  self.db.execute("update scenes set state='RETRY_QUEUED' where id=? and state in ('RETRYABLE','BLOCKED')",(sid,)); self.create_job(s['project_id'],f'RETRY_IMAGE:{sid}'); return self.scene(sid)
- def record_image_attempt(self,sid,success,failed_binary=None,error=None,provider="codex-gpt-image-2"):
+  with self.db.transaction():
+   if self.db.execute("update scenes set state='RETRY_QUEUED' where id=? and state in ('RETRYABLE','BLOCKED')",(sid,)).rowcount!=1: raise PermissionError('illegal retry transition')
+   self.create_job(s['project_id'],f'RETRY_IMAGE:{sid}')
+  return self.scene(sid)
+ def record_image_attempt(self,sid,success,failed_binary=None,error=None,provider="codex-gpt-image-2",role=Role.OPERATOR):
+  self._role(role,'retry')
   scene=self.db.one("select * from scenes where id=?",(sid,))
   if not scene: raise ValueError('scene not found')
   self._active(scene['project_id'])
@@ -109,7 +112,8 @@ class Pipeline:
    self.db.execute("insert into attempts(scene_id,number,provider,state,error,failed_path,failed_sha256,failed_size,created_at) values(?,?,?,?,?,?,?,?,?)",(sid,n,provider,state,error,path,digest,size,now()))
    self.db.execute("update scenes set state=?,checkpoint_json=? where id=?",("IMAGE_READY" if success else ("BLOCKED" if n==3 else "RETRYABLE"),json.dumps({'attempt':n}),sid)); self.event(scene['project_id'],"IMAGE_ATTEMPT",{"scene":scene['code'],"number":n,"state":state})
   if path: Path(path).unlink(missing_ok=True)
- def record_scene_qa(self,sid,evidence):
+ def record_scene_qa(self,sid,evidence,role=Role.REVIEWER):
+  self._role(role,'approve')
   if not isinstance(evidence,QAEvidence): raise TypeError('QAEvidence required')
   s=self.db.one('select * from scenes where id=?',(sid,)); self._active(s['project_id'])
   if s['state']!='IMAGE_READY': raise PermissionError('QA requires ready image')
@@ -133,8 +137,10 @@ class Pipeline:
   if not self._planned_ready(pid): raise PermissionError('valid audio/SRT and at least one planned scene required')
   if not isinstance(ai_qa,QAEvidence) or not ai_qa.passed or not contact_sheet or not os.path.isfile(contact_sheet): raise ValueError('typed AI QA evidence and persisted contact sheet required')
   if self.db.one("select 1 from scenes where project_id=? and (state!='IMAGE_READY' or qa_state!='PASS')",(pid,)): raise PermissionError('complete batch and every scene QA PASS required')
-  aid=self.add_artifact(pid,'CONTACT_SHEET',contact_sheet)
-  self.db.execute("insert into approvals(project_id,gate,decision,actor,created_at) values(?,?,?,?,?)",(pid,'POST_BATCH','APPROVED',actor,now()))
+  with self.db.transaction():
+   # Gate authorization above permits the trusted workflow to ingest its evidence.
+   aid=self.add_artifact(pid,'CONTACT_SHEET',contact_sheet,role=Role.OWNER)
+   self.db.execute("insert into approvals(project_id,gate,decision,actor,created_at) values(?,?,?,?,?)",(pid,'POST_BATCH','APPROVED',actor,now()))
   a=self.db.one('select * from artifacts where id=?',(aid,)); return ContactSheetArtifact(a['id'],a['project_id'],a['uri'],a['sha256'],a['version'],a['status'])
  def start_animation(self,pid,role=Role.OPERATOR):
   self._role(role,'animate')
@@ -173,12 +179,15 @@ class Pipeline:
      if success: break
    finally: self.scheduler.release(kind)
   return [self.scene(s) for s in scene_ids]
- def checkpoint(self,pid,stage,data):
+ def checkpoint(self,pid,stage,data,role=Role.OPERATOR):
+  self._role(role,'checkpoint-list')
   job=self.db.one("select * from jobs where project_id=? order by id desc",(pid,)); jid=job['id'] if job else self.create_job(pid,'PIPELINE')
   snapshot={**data,'data':data,'project':dict(self.db.one('select * from projects where id=?',(pid,))),'job':dict(self.db.one('select * from jobs where id=?',(jid,))),'scenes':[dict(x) for x in self.db.all('select * from scenes where project_id=?',(pid,))]}
   self.db.execute("insert into stages(job_id,name,state,checkpoint_json) values(?,?,?,?) on conflict(job_id,name) do update set state=excluded.state,checkpoint_json=excluded.checkpoint_json",(jid,stage,'SUCCEEDED',json.dumps(snapshot)))
  def propose_rerun(self,pid,stage,role=Role.OPERATOR): self._role(role,'retry'); return self.db.execute("insert into proposals(project_id,stage,state,created_at) values(?,?,?,?)",(pid,stage,'PROPOSED',now())).lastrowid
- def decide_rerun(self,i,approved,actor,role=Role.OWNER): self._role(role,'approve'); self.db.execute("update proposals set state=?,actor=? where id=? and state='PROPOSED'",('APPROVED' if approved else 'REJECTED',actor,i))
+ def decide_rerun(self,i,approved,actor,role=Role.OWNER):
+  self._role(role,'approve')
+  if self.db.execute("update proposals set state=?,actor=? where id=? and state='PROPOSED'",('APPROVED' if approved else 'REJECTED',actor,i)).rowcount!=1: raise PermissionError('illegal rerun decision')
  def apply_rerun(self,i,role=Role.OWNER):
   self._role(role,'dependency')
   p=self.db.one('select * from proposals where id=?',(i,))
@@ -186,12 +195,14 @@ class Pipeline:
   order=['planning','image','qa','animation','assembly','upload']; stage={'plan':'planning'}.get(p['stage'],p['stage'])
   if stage not in order: raise ValueError('unknown stage')
   downstream=order[order.index(stage):]
-  self.db.execute("update jobs set state='BLOCKED',updated_at=? where project_id=? and state in ('QUEUED','RUNNING','PAUSED')",(now(),p['project_id']))
-  arts=self.db.all("select * from artifacts where project_id=? and status='ACTIVE'",(p['project_id'],))
-  for a in arts:
-   if a['kind'].lower() in downstream:self.db.execute("update artifacts set status='SUPERSEDED' where id=?",(a['id'],))
-  self.db.execute("update projects set version=version+1 where id=?",(p['project_id'],))
-  self.db.execute("update proposals set state='APPLIED' where id=?",(i,)); return self.create_job(p['project_id'],'RERUN:'+stage)
+  with self.db.transaction():
+   self.db.execute("update jobs set state='BLOCKED',updated_at=? where project_id=? and state in ('QUEUED','RUNNING','PAUSED')",(now(),p['project_id']))
+   arts=self.db.all("select * from artifacts where project_id=? and status='ACTIVE'",(p['project_id'],))
+   for a in arts:
+    if a['kind'].lower() in downstream:self.db.execute("update artifacts set status='SUPERSEDED' where id=?",(a['id'],))
+   self.db.execute("update projects set version=version+1 where id=?",(p['project_id'],))
+   if self.db.execute("update proposals set state='APPLIED' where id=? and state='APPROVED'",(i,)).rowcount!=1: raise PermissionError('rerun already applied')
+   return self.create_job(p['project_id'],'RERUN:'+stage)
  def add_artifact(self,pid,kind,uri,scene_id=None,parent_id=None,role=Role.OPERATOR):
   self._role(role,'scene-replace'); source=Path(uri).resolve(strict=True); root=self._root(pid)
   # Ingest into owned storage; callers' arbitrary source URI is never later deleted.
@@ -200,10 +211,13 @@ class Pipeline:
    managed=root/(uuid.uuid4().hex+source.suffix); shutil.copyfile(source,managed)
   digest,_=self._hash(managed); version=self.db.one("select coalesce(max(version),0)+1 v from artifacts where project_id=? and kind=? and scene_id is ?",(pid,kind,scene_id))['v']; days=self.db.one('select retention_days from projects where id=?',(pid,))['retention_days']; expires=(datetime.now(timezone.utc)+timedelta(days=days)).isoformat()
   return self.db.execute("insert into artifacts(project_id,scene_id,kind,uri,sha256,version,parent_id,status,created_at,expires_at) values(?,?,?,?,?,?,?,?,?,?)",(pid,scene_id,kind,str(managed),digest,version,parent_id,"ACTIVE",now(),expires)).lastrowid
- def restore_artifact(self,artifact_id):
+ def restore_artifact(self,artifact_id,role=Role.OPERATOR):
+  self._role(role,'checkpoint-list')
   a=self.db.one('select * from artifacts where id=?',(artifact_id,))
   if not a or a['status']=='DELETED' or not os.path.isfile(a['uri']): raise FileNotFoundError('artifact binary unavailable')
-  self.db.execute('update projects set version=version+1,state=\'ACTIVE\' where id=?',(a['project_id'],)); self.event(a['project_id'],'ARTIFACT_RESTORED',{'artifact':artifact_id}); return dict(a)
+  with self.db.transaction():
+   self.db.execute('update projects set version=version+1,state=\'ACTIVE\' where id=?',(a['project_id'],)); self.event(a['project_id'],'ARTIFACT_RESTORED',{'artifact':artifact_id})
+  return dict(a)
  def cleanup(self,role=Role.OWNER):
   self._role(role,'cleanup')
   immutable=('INPUT','MANIFEST','DB','PROMPT','BIBLE','QA_METADATA','CHECKSUM','FINAL')
@@ -228,7 +242,8 @@ class Pipeline:
   self._role(role,'approve' if decision=='APPROVED' else 'reject'); s=self.db.one("select * from scenes where project_id=? and code=?",(pid,code))
   if not s: raise ValueError('scene not found')
   if decision not in ('APPROVED','REJECTED'): raise ValueError('decision')
-  self.db.execute("update scenes set approval_state=? where id=?",(decision,s['id'])); self.db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at) values(?,?,?,?,?,?)",(pid,s['id'],"SCENE",decision,actor,now()))
+  with self.db.transaction():
+   self.db.execute("update scenes set approval_state=? where id=?",(decision,s['id'])); self.db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at) values(?,?,?,?,?,?)",(pid,s['id'],"SCENE",decision,actor,now()))
  def dispatch_discord(self,text,role):
   c=parse_discord(text); self._role(role,c.name)
   legacy={'approve':'scene-approve','reject':'scene-reject','pause':'project-pause','resume':'project-resume','retry':'scene-retry','status':'project-status'}
@@ -294,21 +309,31 @@ class Pipeline:
   r=self.db.one('select stages.* from stages join jobs on jobs.id=stages.job_id where jobs.project_id=? and stages.name=? and stages.state=\'SUCCEEDED\' order by stages.id desc',(pid,stage))
   if not r: raise ValueError('checkpoint not found')
   snap=json.loads(r['checkpoint_json'])
-  if all(k in snap for k in ('project','job','scenes')):
-   p=snap['project']; self.db.execute('update projects set state=?,blocked_reason=?,version=? where id=?',(p['state'],p['blocked_reason'],p['version'],pid))
-   j=snap['job']; self.db.execute('update jobs set state=?,updated_at=? where id=?',(j['state'],now(),j['id']))
-   for s in snap['scenes']:
-    self.db.execute('update scenes set state=?,approval_state=?,qa_state=?,qa_json=?,checkpoint_json=? where id=? and project_id=?',(s['state'],s['approval_state'],s['qa_state'],s.get('qa_json','{}'),s['checkpoint_json'],s['id'],pid))
-  self.event(pid,'CHECKPOINT_RESTORED',{'stage':stage}); return dict(r)
- def observe_cost(self,pid,provider,currency,amount): self.db.execute("insert into cost_observations(project_id,provider,currency,amount,created_at) values(?,?,?,?,?)",(pid,provider,currency,amount,now()))
+  with self.db.transaction():
+   if all(k in snap for k in ('project','job','scenes')):
+    p=snap['project']
+    if self.db.execute('update projects set state=?,blocked_reason=?,version=? where id=?',(p['state'],p['blocked_reason'],p['version'],pid)).rowcount!=1: raise ValueError('project not found')
+    j=snap['job']
+    if self.db.execute('update jobs set state=?,updated_at=? where id=? and project_id=?',(j['state'],now(),j['id'],pid)).rowcount!=1: raise ValueError('checkpoint job missing')
+    for s in snap['scenes']:
+     if self.db.execute('update scenes set state=?,approval_state=?,qa_state=?,qa_json=?,checkpoint_json=? where id=? and project_id=?',(s['state'],s['approval_state'],s['qa_state'],s.get('qa_json','{}'),s['checkpoint_json'],s['id'],pid)).rowcount!=1: raise ValueError('checkpoint scene missing')
+   self.event(pid,'CHECKPOINT_RESTORED',{'stage':stage})
+  return dict(r)
+ def observe_cost(self,pid,provider,currency,amount,role=Role.OPERATOR): self._role(role,'costs'); self.db.execute("insert into cost_observations(project_id,provider,currency,amount,created_at) values(?,?,?,?,?)",(pid,provider,currency,amount,now()))
  def propose_dependency(self,pid,dependency,impact,proposer="system",role=Role.OPERATOR): self._role(role,'dependency-propose'); return self.db.execute("insert into impact_proposals(project_id,dependency,impact_json,state,proposer,created_at) values(?,?,?,?,?,?)",(pid,dependency,json.dumps(impact),"PROPOSED",proposer,now())).lastrowid
- def decide_dependency(self,i,approved,actor,role=Role.OWNER): self._role(role,'approve'); self.db.execute("update impact_proposals set state=?,decider=?,decided_at=? where id=? and state='PROPOSED'",("APPROVED" if approved else "REJECTED",actor,now(),i))
+ def decide_dependency(self,i,approved,actor,role=Role.OWNER):
+  self._role(role,'approve')
+  if self.db.execute("update impact_proposals set state=?,decider=?,decided_at=? where id=? and state='PROPOSED'",("APPROVED" if approved else "REJECTED",actor,now(),i)).rowcount!=1: raise PermissionError('illegal dependency decision')
  def apply_dependency(self,i,role=Role.OWNER):
   self._role(role,'dependency')
   p=self.db.one("select * from impact_proposals where id=?",(i,))
   if not p or p['state']!='APPROVED': raise PermissionError('approval required')
   self.db.execute("update impact_proposals set state='APPLIED',applied_at=? where id=?",(now(),i)); self.event(p['project_id'],"DEPENDENCY_APPLIED",{"dependency":p['dependency']})
- def pause(self,pid,role=Role.OPERATOR): self._role(role,'pause'); self.db.execute("update projects set state='PAUSED' where id=? and state='ACTIVE'",(pid,)); self.event(pid,"PAUSED")
+ def pause(self,pid,role=Role.OPERATOR):
+  self._role(role,'pause')
+  with self.db.transaction():
+   if self.db.execute("update projects set state='PAUSED' where id=? and state='ACTIVE'",(pid,)).rowcount!=1: raise PermissionError('only ACTIVE projects can pause')
+   self.event(pid,"PAUSED")
  def resume(self,pid,role=Role.OPERATOR):
   self._role(role,'resume'); p=self.db.one('select * from projects where id=?',(pid,))
   if not p or p['state']!='PAUSED': raise PermissionError('only PAUSED projects can resume')
