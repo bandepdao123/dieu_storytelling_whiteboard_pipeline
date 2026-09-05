@@ -88,13 +88,22 @@ class Pipeline:
   if s['state']!='IMAGE_READY': raise PermissionError('QA requires ready image')
   payload={'checks':dict(evidence.checks),'score':evidence.score,'evaluator':evidence.evaluator}
   self.db.execute("update scenes set qa_state=?,qa_json=? where id=?",('PASS' if evidence.passed else 'FAIL',json.dumps(payload),sid))
- def _pilot_ready(self,pid): return not self.db.one("select 1 from scenes where project_id=? and (ord<=5 or special=1) and not(state='IMAGE_READY' and qa_state='PASS' and approval_state='APPROVED')",(pid,))
+ def _planned_ready(self,pid):
+  """Require persisted, internally valid source timing and a complete scene plan."""
+  project=self.db.one('select * from projects where id=?',(pid,)); audio=self.db.one('select * from audio where project_id=?',(pid,)); cues=self.db.all('select * from cues where project_id=? order by idx',(pid,)); scenes=self.db.all('select * from scenes where project_id=? order by ord',(pid,))
+  if not project or not audio or not scenes: return False
+  try: validate_timing(audio['duration_ms'],[(x['start_ms'],x['end_ms'],x['text']) for x in cues])
+  except Exception: return False
+  return project['min_scenes']<=len(scenes)<=project['max_scenes'] and [x['ord'] for x in scenes]==list(range(1,len(scenes)+1))
+ def _pilot_ready(self,pid):
+  return self._planned_ready(pid) and not self.db.one("select 1 from scenes where project_id=? and (ord<=5 or special=1) and not(state='IMAGE_READY' and qa_state='PASS' and approval_state='APPROVED')",(pid,))
  def start_batch(self,pid,role=Role.OPERATOR):
   self._role(role,'batch')
   if not self._pilot_ready(pid): raise PermissionError('pilot S001-S005 and special representatives require approval')
   return self.create_job(pid,'BATCH_IMAGE')
  def approve_post_batch(self,pid,ai_qa,contact_sheet,actor,role=Role.REVIEWER):
   self._role(role,'approve')
+  if not self._planned_ready(pid): raise PermissionError('valid audio/SRT and at least one planned scene required')
   if not isinstance(ai_qa,QAEvidence) or not ai_qa.passed or not contact_sheet or not os.path.isfile(contact_sheet): raise ValueError('typed AI QA evidence and persisted contact sheet required')
   if self.db.one("select 1 from scenes where project_id=? and (state!='IMAGE_READY' or qa_state!='PASS')",(pid,)): raise PermissionError('complete batch and every scene QA PASS required')
   aid=self.add_artifact(pid,'CONTACT_SHEET',contact_sheet)
@@ -102,6 +111,7 @@ class Pipeline:
   a=self.db.one('select * from artifacts where id=?',(aid,)); return ContactSheetArtifact(a['id'],a['project_id'],a['uri'],a['sha256'],a['version'],a['status'])
  def start_animation(self,pid,role=Role.OPERATOR):
   self._role(role,'animate')
+  if not self._planned_ready(pid): raise PermissionError('valid audio/SRT and at least one planned scene required')
   if not self.db.one("select 1 from approvals where project_id=? and gate='POST_BATCH' and decision='APPROVED'",(pid,)): raise PermissionError('post-batch human approval required')
   return self.create_job(pid,'ANIMATION')
  def _active(self,pid):
@@ -190,7 +200,7 @@ class Pipeline:
    elif c.name=='plan': return self.plan_scenes(a[0],role=role)
    elif c.name=='scene-retry': return self.queue_retry(int(a[0]),role)
    elif c.name in ('scene-approve','scene-reject'): self.decide_scene(a[0],a[1],'APPROVED' if c.name.endswith('approve') else 'REJECTED','discord',role)
-   elif c.name=='stage-run': return {'job_id':self.create_job(a[0],a[1].upper())}
+   elif c.name=='stage-run': return {'job_id':self.run_stage(a[0],a[1],role)}
    elif c.name=='stage-rerun': return {'proposal_id':self.propose_rerun(a[0],a[1],role)}
    elif c.name=='checkpoint-list': return [dict(x) for x in self.db.all('select stages.* from stages join jobs on jobs.id=stages.job_id where jobs.project_id=? order by stages.id',a)]
    elif c.name=='checkpoint-restore': return self.restore_latest_checkpoint(a[0],a[1],role)
@@ -216,6 +226,20 @@ class Pipeline:
   except (ValueError,TypeError) as e:
    if isinstance(e,CommandError): raise
    raise CommandError('INVALID_ARGUMENT',str(e)) from e
+
+ def run_stage(self,pid,stage,role=Role.OPERATOR):
+  """Generic entry point may delegate to gates, never manufacture protected jobs."""
+  normalized=stage.strip().lower().replace('_','-')
+  if normalized in ('image','batch','batch-image'): return self.start_batch(pid,role)
+  if normalized in ('animation','animate'): return self.start_animation(pid,role)
+  if normalized in ('qa','assembly','final','upload'):
+   raise PermissionError(f'{normalized} requires its dedicated evidence/gated workflow')
+  if normalized in ('plan','planning'):
+   # Planning is execution, not merely queuing a stage-shaped job.
+   self.plan_scenes(pid,role=role)
+   job=self.db.one("select * from jobs where project_id=? order by id desc",(pid,))
+   return job['id']
+  raise ValueError('unknown stage')
 
  def restore_latest_checkpoint(self,pid,stage,role=Role.OPERATOR):
   self._role(role,'checkpoint-list')
