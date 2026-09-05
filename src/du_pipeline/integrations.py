@@ -89,7 +89,8 @@ class DriveAdapter:
     loops+=1
     if loops>self.max_chunks:raise VerificationError('upload progress bound exceeded')
     chunk=f.read(min(self.chunk_size,size-offset));new=retry_call(lambda:self.client.upload_chunk(session,offset,chunk),sleep=self.sleep)
-    if not isinstance(new,int) or new<=offset or new>size:raise VerificationError('invalid upload progress')
+    expected=offset+len(chunk)
+    if not chunk or not isinstance(new,int) or isinstance(new,bool) or new!=expected:raise VerificationError('invalid upload offset')
     offset=new;f.seek(offset)
   rid=retry_call(lambda:self.client.finish_upload(session),sleep=self.sleep);meta=retry_call(lambda:self.client.metadata(rid),sleep=self.sleep)
   if meta.get('size') is None or int(meta['size'])!=size:raise VerificationError('remote size evidence missing or mismatch')
@@ -115,8 +116,6 @@ class DiscordBridge:
  def dispatch(self,message_id,user_id,text,dry_run=False):
   from .adapters import parse_discord,authorize,CommandError
   from .service import now
-  existing=self.pipeline.db.one('select response_json,state from discord_messages where message_id=?',(message_id,))
-  if existing and existing[0]:return json.loads(existing[0])
   if dry_run:
    if user_id not in self.allowlist:return {'type':'TU_CHOI','ok':False,'message':'Bạn không có quyền sử dụng bot.'}
    try:c=parse_discord(text)
@@ -124,14 +123,22 @@ class DiscordBridge:
    return {'type':'DRY_RUN','ok':authorize(Role(self.allowlist[user_id]),c.name),'message':'Lệnh hợp lệ và được phép; chưa thực thi.'}
   def audit(o,d):self.pipeline.db.execute('insert into integration_attempts(source,external_id,user_id,outcome,detail,created_at) values(?,?,?,?,?,?)',('DISCORD',message_id,user_id,o,d,now()))
   if user_id not in self.allowlist:audit('DENIED','unauthorized');return {'type':'TU_CHOI','ok':False,'message':'Bạn không có quyền sử dụng bot.'}
+  # A message id is scoped to its original authorized caller.  Check that
+  # identity before replaying either a response or lease state; this also
+  # preserves idempotency when retry text differs or is no longer parseable.
+  existing=self.pipeline.db.one('select response_json,state,lease_expires_at,user_id from discord_messages where message_id=?',(message_id,))
+  if existing and existing[3]!=user_id:audit('DENIED','message_owner');return {'type':'TU_CHOI','ok':False,'message':'Bạn không có quyền truy cập lệnh này.'}
+  if existing and existing[0]:audit('REPLAY','cached');return json.loads(existing[0])
+  if existing and existing[2] and existing[2]>=datetime.now(timezone.utc).isoformat():audit('ACTIVE_LEASE','processing');return self.status(message_id)
   try:c=parse_discord(text)
   except CommandError as e:audit('INVALID',e.code);return {'type':'LOI_LENH','ok':False,'message':str(e)}
   if not authorize(Role(self.allowlist[user_id]),c.name):audit('DENIED','rbac');return {'type':'TU_CHOI','ok':False,'message':'Vai trò không được phép thực hiện lệnh này.'}
   expiry=(datetime.now(timezone.utc)+timedelta(seconds=self.lease_seconds)).isoformat();nowiso=datetime.now(timezone.utc).isoformat()
   with self.pipeline.db.transaction():
-   old=self.pipeline.db.one('select response_json,state,lease_expires_at from discord_messages where message_id=?',(message_id,))
-   if old and old[0]:return json.loads(old[0])
-   if old and old[2] and old[2]>=nowiso:return self.status(message_id)
+   old=self.pipeline.db.one('select response_json,state,lease_expires_at,user_id from discord_messages where message_id=?',(message_id,))
+   if old and old[3]!=user_id:audit('DENIED','message_owner');return {'type':'TU_CHOI','ok':False,'message':'Bạn không có quyền truy cập lệnh này.'}
+   if old and old[0]:audit('REPLAY','cached');return json.loads(old[0])
+   if old and old[2] and old[2]>=nowiso:audit('ACTIVE_LEASE','processing');return self.status(message_id)
    if old:self.pipeline.db.execute("update discord_messages set state='PROCESSING',lease_owner=?,lease_expires_at=? where message_id=?",(self.owner,expiry,message_id))
    else:self.pipeline.db.execute("insert into discord_messages(message_id,user_id,response_json,created_at,state,lease_owner,lease_expires_at) values(?,?,NULL,?,'PROCESSING',?,?)",(message_id,user_id,now(),self.owner,expiry))
   try:r={'type':'THANH_CONG','ok':True,'message':'Đã thực thi lệnh.','data':self.pipeline.dispatch_discord(text,Role(self.allowlist[user_id]))}
