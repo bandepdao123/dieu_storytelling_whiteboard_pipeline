@@ -2,7 +2,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 class SchemaVersionError(RuntimeError): pass
 
@@ -47,7 +47,7 @@ class Database:
      if statement.strip(): self.conn.execute(statement)
     self.conn.execute('PRAGMA user_version=1'); version=1
    # Explicit 1 -> 2 additive upgrade from the original schema; 2 is verified below.
-   if version not in (1,2,3,4): raise SchemaVersionError(f'unsupported schema version {version}')
+   if version not in (1,2,3,4,5): raise SchemaVersionError(f'unsupported schema version {version}')
    cols={r[1] for r in self.conn.execute('pragma table_info(projects)')}
    if version == 2 and 'artifact_root' not in cols: raise SchemaVersionError('schema version 2 does not match structure')
    additions=[('min_scenes','INTEGER NOT NULL DEFAULT 50'),('max_scenes','INTEGER NOT NULL DEFAULT 360'),('retention_days','INTEGER NOT NULL DEFAULT 3'),('output_json',"TEXT NOT NULL DEFAULT '{}'") ,('version','INTEGER NOT NULL DEFAULT 1'),('artifact_root','TEXT')]
@@ -66,6 +66,16 @@ class Database:
    if 'state' not in dcols:self.conn.execute("ALTER TABLE discord_messages ADD COLUMN state TEXT NOT NULL DEFAULT 'COMPLETED'")
    if 'error' not in dcols:self.conn.execute('ALTER TABLE discord_messages ADD COLUMN error TEXT')
    self.conn.execute('CREATE TABLE IF NOT EXISTS integration_attempts(id INTEGER PRIMARY KEY,source TEXT NOT NULL,external_id TEXT,user_id TEXT,outcome TEXT NOT NULL,detail TEXT,created_at TEXT NOT NULL)')
+   icols={r[1] for r in self.conn.execute('pragma table_info(integration_commands)')}
+   if 'state' not in icols:
+    self.conn.execute('ALTER TABLE integration_commands RENAME TO integration_commands_old')
+    self.conn.execute("CREATE TABLE integration_commands(source TEXT,external_id TEXT,project_id TEXT REFERENCES projects(id),created_at TEXT,state TEXT NOT NULL DEFAULT 'COMPLETED',lease_owner TEXT,lease_expires_at TEXT,detail TEXT,PRIMARY KEY(source,project_id,external_id))")
+    self.conn.execute("INSERT INTO integration_commands(source,external_id,project_id,created_at) SELECT source,external_id,project_id,created_at FROM integration_commands_old")
+    self.conn.execute('DROP TABLE integration_commands_old')
+   dcols={r[1] for r in self.conn.execute('pragma table_info(discord_messages)')}
+   if 'lease_owner' not in dcols:self.conn.execute('ALTER TABLE discord_messages ADD COLUMN lease_owner TEXT')
+   if 'lease_expires_at' not in dcols:self.conn.execute('ALTER TABLE discord_messages ADD COLUMN lease_expires_at TEXT')
+   self.conn.execute('CREATE TABLE IF NOT EXISTS remote_uploads(project_id TEXT,local_path TEXT,remote_id TEXT,state TEXT,size INTEGER,sha256 TEXT,error TEXT,updated_at TEXT,PRIMARY KEY(project_id,local_path))')
    # Composite ownership safeguards without rebuilding legacy tables.
    ownership=(
     ('artifact_scene_project','artifacts',"NEW.scene_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM scenes WHERE id=NEW.scene_id AND project_id=NEW.project_id)",'cross-project scene'),

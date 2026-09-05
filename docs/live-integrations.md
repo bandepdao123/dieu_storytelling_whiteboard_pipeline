@@ -9,8 +9,11 @@ and row payloads are never logged.
 1. Put a **user OAuth** token outside this repository and set `DU_GOOGLE_OAUTH_TOKEN_PATH`.
    The file must exist and be readable. Authentication is never initiated automatically.
 2. Optionally set `DU_GOOGLE_DRIVE_ROOT_ID` (the documented production root is the default).
-3. Install a deployment plugin that supplies the Sheets/Drive client methods documented in
-   `du_pipeline.integrations`; the core intentionally does not bind to a Google SDK.
+3. Install a deployment plugin and set `DU_INTEGRATION_CLIENT_FACTORY=module:callable`.
+   The callable is invoked as `callable(kind)` (`sheets` or `drive`) and its concrete callable
+   methods are validated immediately. The core intentionally does not bind to a Google SDK.
+   `du_pipeline.example_clients:placeholder_factory` is an executable secret-free negative
+   example and is intentionally rejected; replace it with the deployment wrapper.
 4. Set `DU_DISCORD_ALLOWLIST_JSON` to a JSON object mapping user IDs to `OWNER`, `REVIEWER`,
    or `OPERATOR`. The bridge has no Discord SDK dependency and can be called by Hermes gateway.
 

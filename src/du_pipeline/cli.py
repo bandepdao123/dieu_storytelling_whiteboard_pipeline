@@ -37,6 +37,9 @@ def integration_client(kind):
   module,name=spec.split(':',1); client=getattr(importlib.import_module(module),name)(kind)
  except Exception as exc: raise IntegrationConfigurationError(f'cannot load integration client factory {spec!r}: {exc}') from exc
  if client is None: raise IntegrationConfigurationError(f'factory did not provide a {kind} client')
+ required={'sheets':('find_spreadsheet','create_spreadsheet','get_tabs','add_tabs','batch_upsert','read_rows'),'drive':('ensure_folder','begin_upload','upload_chunk','finish_upload','metadata')}
+ missing=[n for n in required.get(kind,()) if not callable(getattr(client,n,None))]
+ if missing: raise IntegrationConfigurationError(f'{kind} client missing required methods: {", ".join(missing)}')
  return client
 def main(argv=None):
  a=parser().parse_args(argv); svc=Pipeline(Database(a.db)); result={}
@@ -63,6 +66,7 @@ def main(argv=None):
   allow=json.loads(__import__('os').environ.get('DU_DISCORD_ALLOWLIST_JSON','{}'))
   result=DiscordBridge(svc,allow).dispatch(a.message_id,a.user_id,a.text,a.dry_run)
  elif a.cmd=='discord-status':
-  row=svc.db.one('select response_json from discord_messages where message_id=?',(a.message_id,)); result=json.loads(row[0]) if row else {'type':'KHONG_TIM_THAY','ok':False,'message':'Không tìm thấy tin nhắn.'}
+  from .integrations import DiscordBridge
+  result=DiscordBridge(svc,{}).status(a.message_id)
  print(json.dumps(result,ensure_ascii=False)); return 0
 if __name__=='__main__': raise SystemExit(main())
