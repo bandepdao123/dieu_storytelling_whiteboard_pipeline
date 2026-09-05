@@ -3,7 +3,7 @@ from datetime import datetime,timezone,timedelta
 from .policies import validate_timing,required_approval,DurationPolicy
 from .contracts import OutputConfig,ContactSheetArtifact
 from .policies import ResourceScheduler
-from .adapters import Role,authorize,parse_discord
+from .adapters import Role,authorize,parse_discord,CommandError
 
 def now(): return datetime.now(timezone.utc).isoformat()
 class Pipeline:
@@ -41,15 +41,21 @@ class Pipeline:
   # Semantic boundaries are cue boundaries, subdivided according to DurationPolicy.
   planned=[]
   for c in cues:
-   cursor=c['start_ms']; length=c['end_ms']-cursor; target=self.duration_policy.choose(cursor/1000,length/1000)*1000
-   pieces=max(1,round(length/target))
-   for n in range(pieces):
-    s=round(cursor+n*length/pieces); e=round(cursor+(n+1)*length/pieces); planned.append((s,e,c['text']))
+   # 180s changes policy.  Never let a generated scene straddle that boundary.
+   units=[(c['start_ms'],c['end_ms'])]
+   if c['start_ms']<180000<c['end_ms']: units=[(c['start_ms'],180000),(180000,c['end_ms'])]
+   for us,ue in units:
+    length=ue-us; lo,hi=self.duration_policy.bounds_at(us/1000); target=self.duration_policy.choose(us/1000,length/1000)*1000
+    pieces=max(1,round(length/target))
+    for n in range(pieces):
+     s=round(us+n*length/pieces); e=round(us+(n+1)*length/pieces)
+     exc=None if lo*1000<=e-s<=hi*1000 else json.dumps({'reason':'unavoidable_semantic_unit','actual_ms':e-s,'target_min_ms':lo*1000,'target_max_ms':hi*1000})
+     planned.append((s,e,c['text'],exc))
   if not project['min_scenes']<=len(planned)<=project['max_scenes']: raise ValueError(f"scene count {len(planned)} outside configured {project['min_scenes']}-{project['max_scenes']}")
   self.db.execute("delete from scenes where project_id=?",(pid,))
-  for i,(s,e,text) in enumerate(planned,1):
+  for i,(s,e,text,exc) in enumerate(planned,1):
    code=f"S{i:03d}"; special=code in special_codes; gate=required_approval(code,special)
-   self.db.execute("insert into scenes(project_id,code,ord,start_ms,end_ms,text,special,state,approval_state) values(?,?,?,?,?,?,?,?,?)",(pid,code,i,s,e,text,special,"PLANNED","REQUIRED" if gate else "NOT_REQUIRED"))
+   self.db.execute("insert into scenes(project_id,code,ord,start_ms,end_ms,text,special,state,approval_state,duration_exception) values(?,?,?,?,?,?,?,?,?,?)",(pid,code,i,s,e,text,special,"PLANNED","REQUIRED" if gate else "NOT_REQUIRED",exc))
   self.event(pid,"SCENES_PLANNED",{"count":len(planned)}); self.checkpoint(pid,'plan',{'count':len(planned)}); return [dict(x) for x in self.db.all("select * from scenes where project_id=? order by ord",(pid,))]
  def scene(self,sid): return dict(self.db.one("select * from scenes where id=?",(sid,)))
  def queue_retry(self,sid,role=Role.OPERATOR):
@@ -110,10 +116,19 @@ class Pipeline:
   self.db.execute("insert into stages(job_id,name,state,checkpoint_json) values(?,?,?,?) on conflict(job_id,name) do update set state=excluded.state,checkpoint_json=excluded.checkpoint_json",(jid,stage,'SUCCEEDED',json.dumps(data)))
  def propose_rerun(self,pid,stage,role=Role.OPERATOR): self._role(role,'retry'); return self.db.execute("insert into proposals(project_id,stage,state,created_at) values(?,?,?,?)",(pid,stage,'PROPOSED',now())).lastrowid
  def decide_rerun(self,i,approved,actor,role=Role.OWNER): self._role(role,'approve'); self.db.execute("update proposals set state=?,actor=? where id=? and state='PROPOSED'",('APPROVED' if approved else 'REJECTED',actor,i))
- def apply_rerun(self,i):
+ def apply_rerun(self,i,role=Role.OWNER):
+  self._role(role,'dependency')
   p=self.db.one('select * from proposals where id=?',(i,))
   if not p or p['state']!='APPROVED': raise PermissionError('rerun approval required')
-  self.db.execute("update proposals set state='APPLIED' where id=?",(i,)); return self.create_job(p['project_id'],'RERUN:'+p['stage'])
+  order=['planning','image','qa','animation','assembly','upload']; stage={'plan':'planning'}.get(p['stage'],p['stage'])
+  if stage not in order: raise ValueError('unknown stage')
+  downstream=order[order.index(stage):]
+  self.db.execute("update jobs set state='BLOCKED',updated_at=? where project_id=? and state in ('QUEUED','RUNNING','PAUSED')",(now(),p['project_id']))
+  arts=self.db.all("select * from artifacts where project_id=? and status='ACTIVE'",(p['project_id'],))
+  for a in arts:
+   if a['kind'].lower() in downstream:self.db.execute("update artifacts set status='SUPERSEDED' where id=?",(a['id'],))
+  self.db.execute("update projects set version=version+1 where id=?",(p['project_id'],))
+  self.db.execute("update proposals set state='APPLIED' where id=?",(i,)); return self.create_job(p['project_id'],'RERUN:'+stage)
  def add_artifact(self,pid,kind,uri,scene_id=None,parent_id=None):
   data=open(uri,'rb').read(); digest=hashlib.sha256(data).hexdigest(); version=self.db.one("select coalesce(max(version),0)+1 v from artifacts where project_id=? and kind=? and scene_id is ?",(pid,kind,scene_id))['v']; days=self.db.one('select retention_days from projects where id=?',(pid,))['retention_days']; expires=(datetime.now(timezone.utc)+timedelta(days=days)).isoformat()
   return self.db.execute("insert into artifacts(project_id,scene_id,kind,uri,sha256,version,parent_id,status,created_at,expires_at) values(?,?,?,?,?,?,?,?,?,?)",(pid,scene_id,kind,uri,digest,version,parent_id,"ACTIVE",now(),expires)).lastrowid
@@ -121,8 +136,10 @@ class Pipeline:
   a=self.db.one('select * from artifacts where id=?',(artifact_id,))
   if not a or a['status']=='DELETED' or not os.path.isfile(a['uri']): raise FileNotFoundError('artifact binary unavailable')
   self.db.execute('update projects set version=version+1,state=\'ACTIVE\' where id=?',(a['project_id'],)); self.event(a['project_id'],'ARTIFACT_RESTORED',{'artifact':artifact_id}); return dict(a)
- def cleanup(self):
-  rows=self.db.all("select * from artifacts where status='ACTIVE' and expires_at<?",(now(),))
+ def cleanup(self,role=Role.OWNER):
+  self._role(role,'cleanup')
+  immutable=('INPUT','MANIFEST','DB','PROMPT','BIBLE','QA_METADATA','CHECKSUM','FINAL')
+  rows=self.db.all("select * from artifacts where status='ACTIVE' and expires_at<? and upper(kind) not in (%s)" % ','.join('?'*len(immutable)),(now(),*immutable))
   for r in rows:
    if os.path.isfile(r['uri']): os.remove(r['uri'])
    self.db.execute("update artifacts set status='DELETED',deleted_at=? where id=?",(now(),r['id']))
@@ -135,13 +152,42 @@ class Pipeline:
   self.db.execute("update scenes set approval_state=? where id=?",(decision,s['id'])); self.db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at) values(?,?,?,?,?,?)",(pid,s['id'],"SCENE",decision,actor,now()))
  def dispatch_discord(self,text,role):
   c=parse_discord(text); self._role(role,c.name)
-  if c.name in ('approve','reject'): self.decide_scene(c.args[0],c.args[1],'APPROVED' if c.name=='approve' else 'REJECTED','discord',role)
-  elif c.name=='retry': return self.queue_retry(int(c.args[0]),role)
-  elif c.name=='pause': self.pause(c.args[0],role)
-  elif c.name=='resume': self.resume(c.args[0],role)
-  elif c.name=='status': return self.status(c.args[0],role)
-  else: raise ValueError('unsupported command')
-  return {'ok':True}
+  legacy={'approve':'scene-approve','reject':'scene-reject','pause':'project-pause','resume':'project-resume','retry':'scene-retry','status':'project-status'}
+  c=type(c)(legacy.get(c.name,c.name),c.args)
+  schemas={'project-create':(1,2),'project-status':(1,1),'project-config':(3,3),'project-start':(1,1),'project-pause':(1,1),'project-resume':(1,1),'project-cancel':(1,1),'import':(2,2),'plan':(1,1),'pilot-approve':(1,1),'pilot-reject':(1,1),'batch-approve':(1,1),'batch-reject':(1,1),'scene-status':(2,2),'scene-retry':(1,1),'scene-approve':(2,2),'scene-reject':(2,2),'scene-replace':(2,2),'stage-run':(2,2),'stage-rerun':(2,2),'checkpoint-list':(1,1),'checkpoint-restore':(2,2),'dependency-propose':(3,3),'dependency-approve':(1,1),'dependency-apply':(1,1),'provider-select':(2,2),'preset-select':(2,2),'cost-report':(1,1),'error-report':(1,1),'final-approve':(1,1)}
+  lo,hi=schemas[c.name]
+  if not lo<=len(c.args)<=hi: raise CommandError('INVALID_ARGUMENTS',f'{c.name} expects {lo}..{hi} arguments')
+  a=c.args
+  try:
+   if c.name=='project-create': return {'project_id':self.init_project(a[0],a[1] if len(a)>1 else 'vi',role=role)}
+   if c.name in ('project-status','scene-status'): return self.status(a[0],role) if c.name=='project-status' else dict(self.db.one('select * from scenes where project_id=? and code=?',a))
+   if c.name=='project-pause': self.pause(a[0],role)
+   elif c.name in ('project-start','project-resume'): self.resume(a[0],role)
+   elif c.name=='project-cancel': self.db.execute("update projects set state='COMPLETED' where id=?",(a[0],))
+   elif c.name=='plan': return self.plan_scenes(a[0],role=role)
+   elif c.name=='scene-retry': return self.queue_retry(int(a[0]),role)
+   elif c.name in ('scene-approve','scene-reject'): self.decide_scene(a[0],a[1],'APPROVED' if c.name.endswith('approve') else 'REJECTED','discord',role)
+   elif c.name=='stage-run': return {'job_id':self.create_job(a[0],a[1].upper())}
+   elif c.name=='stage-rerun': return {'proposal_id':self.propose_rerun(a[0],a[1],role)}
+   elif c.name=='checkpoint-list': return [dict(x) for x in self.db.all('select stages.* from stages join jobs on jobs.id=stages.job_id where jobs.project_id=? order by stages.id',a)]
+   elif c.name=='checkpoint-restore': return self.restore_latest_checkpoint(a[0],a[1],role)
+   elif c.name=='dependency-propose': return {'proposal_id':self.propose_dependency(a[0],a[1],{'impact':a[2]},role=role)}
+   elif c.name=='dependency-approve': self.decide_dependency(int(a[0]),True,'discord',role)
+   elif c.name=='dependency-apply': self.apply_dependency(int(a[0]),role)
+   elif c.name in ('provider-select','preset-select','project-config'): self.event(a[0],c.name.upper(),{'key':a[-2] if len(a)==3 else c.name,'value':a[-1]})
+   elif c.name in ('cost-report','error-report'): return self.report(a[0])['costs' if c.name=='cost-report' else 'errors']
+   elif c.name.endswith(('approve','reject')): self.db.execute("insert into approvals(project_id,gate,decision,actor,created_at) values(?,?,?,?,?)",(a[0],c.name.split('-')[0].upper(),'APPROVED' if c.name.endswith('approve') else 'REJECTED','discord',now()))
+   elif c.name in ('import','scene-replace'): self.event(a[0] if c.name=='import' else self.scene(int(a[0]))['project_id'],c.name.upper(),{'value':a[1]})
+   return {'ok':True}
+  except (ValueError,TypeError) as e:
+   if isinstance(e,CommandError): raise
+   raise CommandError('INVALID_ARGUMENT',str(e)) from e
+
+ def restore_latest_checkpoint(self,pid,stage,role=Role.OPERATOR):
+  self._role(role,'checkpoint-list')
+  r=self.db.one('select stages.* from stages join jobs on jobs.id=stages.job_id where jobs.project_id=? and stages.name=? and stages.state=\'SUCCEEDED\' order by stages.id desc',(pid,stage))
+  if not r: raise ValueError('checkpoint not found')
+  self.event(pid,'CHECKPOINT_RESTORED',{'stage':stage,'checkpoint':json.loads(r['checkpoint_json'])}); return dict(r)
  def observe_cost(self,pid,provider,currency,amount): self.db.execute("insert into cost_observations(project_id,provider,currency,amount,created_at) values(?,?,?,?,?)",(pid,provider,currency,amount,now()))
  def propose_dependency(self,pid,dependency,impact,proposer="system",role=Role.OPERATOR): self._role(role,'dependency-propose'); return self.db.execute("insert into impact_proposals(project_id,dependency,impact_json,state,proposer,created_at) values(?,?,?,?,?,?)",(pid,dependency,json.dumps(impact),"PROPOSED",proposer,now())).lastrowid
  def decide_dependency(self,i,approved,actor,role=Role.OWNER): self._role(role,'approve'); self.db.execute("update impact_proposals set state=?,decider=?,decided_at=? where id=? and state='PROPOSED'",("APPROVED" if approved else "REJECTED",actor,now(),i))
