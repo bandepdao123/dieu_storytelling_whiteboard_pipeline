@@ -2,7 +2,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 class SchemaVersionError(RuntimeError): pass
 
@@ -35,11 +35,12 @@ CREATE TABLE IF NOT EXISTS discord_messages(message_id TEXT PRIMARY KEY,user_id 
 APPEND=("events","cost_observations","time_observations","learning_metadata")
 class Database:
  def __init__(self,path):
-  self.path=Path(path); self.conn=sqlite3.connect(self.path); self.conn.row_factory=sqlite3.Row; self._tx_depth=0
-  self.conn.execute('PRAGMA foreign_keys=ON'); self.conn.execute('PRAGMA journal_mode=WAL')
-  version=self.conn.execute('PRAGMA user_version').fetchone()[0]
-  if version>SCHEMA_VERSION: raise SchemaVersionError(f'unsupported schema version {version}')
+  self.path=Path(path); self.conn=sqlite3.connect(self.path); self._tx_depth=0
   try:
+   self.conn.row_factory=sqlite3.Row
+   self.conn.execute('PRAGMA foreign_keys=ON'); self.conn.execute('PRAGMA journal_mode=WAL')
+   version=self.conn.execute('PRAGMA user_version').fetchone()[0]
+   if version>SCHEMA_VERSION: raise SchemaVersionError(f'unsupported schema version {version}')
    self.conn.execute('BEGIN IMMEDIATE')
    # executescript commits implicitly; execute individual DDL so migration is atomic.
    if version == 0:
@@ -47,7 +48,7 @@ class Database:
      if statement.strip(): self.conn.execute(statement)
     self.conn.execute('PRAGMA user_version=1'); version=1
    # Explicit 1 -> 2 additive upgrade from the original schema; 2 is verified below.
-   if version not in (1,2,3,4,5): raise SchemaVersionError(f'unsupported schema version {version}')
+   if version not in (1,2,3,4,5,6): raise SchemaVersionError(f'unsupported schema version {version}')
    cols={r[1] for r in self.conn.execute('pragma table_info(projects)')}
    if version == 2 and 'artifact_root' not in cols: raise SchemaVersionError('schema version 2 does not match structure')
    additions=[('min_scenes','INTEGER NOT NULL DEFAULT 50'),('max_scenes','INTEGER NOT NULL DEFAULT 360'),('retention_days','INTEGER NOT NULL DEFAULT 3'),('output_json',"TEXT NOT NULL DEFAULT '{}'") ,('version','INTEGER NOT NULL DEFAULT 1'),('artifact_root','TEXT')]
@@ -75,6 +76,28 @@ class Database:
    dcols={r[1] for r in self.conn.execute('pragma table_info(discord_messages)')}
    if 'lease_owner' not in dcols:self.conn.execute('ALTER TABLE discord_messages ADD COLUMN lease_owner TEXT')
    if 'lease_expires_at' not in dcols:self.conn.execute('ALTER TABLE discord_messages ADD COLUMN lease_expires_at TEXT')
+   acols={r[1] for r in self.conn.execute('pragma table_info(approvals)')}
+   for name,ddl in [('project_version','INTEGER'),('evidence_sha256','TEXT'),('revoked_at','TEXT'),('revoked_reason','TEXT')]:
+    if name not in acols:self.conn.execute(f'ALTER TABLE approvals ADD COLUMN {name} {ddl}')
+   jcols={r[1] for r in self.conn.execute('pragma table_info(jobs)')}
+   for name,ddl in [('project_version','INTEGER'),('lease_owner','TEXT'),('lease_expires_at','TEXT'),('attempt_count','INTEGER NOT NULL DEFAULT 0')]:
+    if name not in jcols:self.conn.execute(f'ALTER TABLE jobs ADD COLUMN {name} {ddl}')
+   self.conn.execute("UPDATE jobs SET project_version=(SELECT version FROM projects WHERE projects.id=jobs.project_id) WHERE project_version IS NULL")
+   groups=self.conn.execute("SELECT project_id,kind,project_version FROM jobs WHERE state IN ('QUEUED','RUNNING','PAUSED') GROUP BY project_id,kind,project_version HAVING count(*)>1").fetchall()
+   for group in groups:
+    active=self.conn.execute("SELECT id,state FROM jobs WHERE project_id=? AND kind=? AND project_version=? AND state IN ('QUEUED','RUNNING','PAUSED') ORDER BY CASE state WHEN 'RUNNING' THEN 3 WHEN 'PAUSED' THEN 2 ELSE 1 END DESC, updated_at DESC, id DESC",(group['project_id'],group['kind'],group['project_version'])).fetchall()
+    keep_id=active[0]['id']; duplicate_ids=[r['id'] for r in active[1:]]
+    previous_states={str(r['id']):r['state'] for r in active[1:]}
+    self.conn.executemany("UPDATE jobs SET state='BLOCKED',lease_owner=NULL,lease_expires_at=NULL WHERE id=?",[(i,) for i in duplicate_ids])
+    import json,datetime
+    detail=json.dumps({'kind':group['kind'],'project_version':group['project_version'],'retained_job_id':keep_id,'retained_state':active[0]['state'],'blocked_job_ids':duplicate_ids,'blocked_previous_states':previous_states,'selection_policy':'RUNNING>PAUSED>QUEUED, updated_at DESC, id DESC'},sort_keys=True)
+    self.conn.execute("INSERT INTO events(project_id,type,data_json,created_at) VALUES(?,?,?,?)",(group['project_id'],'MIGRATION_ACTIVE_JOBS_RECONCILED',detail,datetime.datetime.now(datetime.timezone.utc).isoformat()))
+   self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_one_active ON jobs(project_id,kind,project_version) WHERE state IN ('QUEUED','RUNNING','PAUSED')")
+   self.conn.execute('CREATE INDEX IF NOT EXISTS idx_scenes_project_ord ON scenes(project_id,ord)')
+   self.conn.execute('CREATE INDEX IF NOT EXISTS idx_jobs_project_state_id ON jobs(project_id,state,id)')
+   self.conn.execute('CREATE INDEX IF NOT EXISTS idx_events_project_type_id ON events(project_id,type,id)')
+   self.conn.execute('CREATE INDEX IF NOT EXISTS idx_artifacts_cleanup ON artifacts(status,expires_at,project_id)')
+   self.conn.execute('CREATE INDEX IF NOT EXISTS idx_attempts_scene_number ON attempts(scene_id,number)')
    self.conn.execute('CREATE TABLE IF NOT EXISTS remote_uploads(project_id TEXT,local_path TEXT,remote_id TEXT,state TEXT,size INTEGER,sha256 TEXT,error TEXT,updated_at TEXT,PRIMARY KEY(project_id,local_path))')
    # Composite ownership safeguards without rebuilding legacy tables.
    ownership=(
@@ -84,11 +107,16 @@ class Database:
    for name,table,condition,message in ownership:
     for operation in ('INSERT','UPDATE'):
      self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS {name}_{operation.lower()} BEFORE {operation} ON {table} WHEN {condition} BEGIN SELECT RAISE(ABORT,'{message}'); END")
-   self.conn.execute(f'PRAGMA user_version={SCHEMA_VERSION}'); self.conn.commit()
+   self.conn.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
+   if self.conn.execute('PRAGMA integrity_check').fetchone()[0]!='ok': raise sqlite3.DatabaseError('integrity check failed')
+   if self.conn.execute('PRAGMA foreign_key_check').fetchone(): raise sqlite3.IntegrityError('foreign key check failed')
+   self.conn.commit()
   except Exception:
-   self.conn.rollback(); raise
-  if self.conn.execute('PRAGMA integrity_check').fetchone()[0]!='ok': raise sqlite3.DatabaseError('integrity check failed')
-  if self.conn.execute('PRAGMA foreign_key_check').fetchone(): raise sqlite3.IntegrityError('foreign key check failed')
+   self.conn.rollback(); self.conn.close(); self.conn=None; raise
+ def close(self):
+  if self.conn is not None:self.conn.close();self.conn=None
+ def __enter__(self): return self
+ def __exit__(self,*exc): self.close()
  @contextmanager
  def transaction(self):
   outer=self._tx_depth==0

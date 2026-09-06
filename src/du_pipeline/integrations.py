@@ -61,16 +61,19 @@ class SheetsAdapter:
    key=str(row.get('command_id','')).strip();action=str(row.get('command','')).upper()
    state='QUARANTINED' if not key or action not in ('APPROVE','REJECT') else 'PROCESSING'
    if not key:key='row-'+hashlib.sha256(json.dumps(row,sort_keys=True).encode()).hexdigest()[:16]
-   try:
-    with self.db.transaction():self.db.execute('insert into integration_commands(source,external_id,project_id,created_at,state,lease_owner,lease_expires_at,detail) values(?,?,?,?,?,?,?,?)',('SHEET',key,pid,now(),state,owner,(datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(),None))
-   except Exception:continue
+   expiry=(datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(); current=datetime.now(timezone.utc).isoformat()
+   with self.db.transaction():
+    claimed=self.db.execute("insert into integration_commands(source,external_id,project_id,created_at,state,lease_owner,lease_expires_at,detail) values(?,?,?,?,?,?,?,?) on conflict(source,project_id,external_id) do update set state=excluded.state,lease_owner=excluded.lease_owner,lease_expires_at=excluded.lease_expires_at,detail=NULL where integration_commands.state='FAILED' or (integration_commands.state='PROCESSING' and integration_commands.lease_expires_at<?)",('SHEET',key,pid,now(),state,owner,expiry,None,current)).rowcount
+   if not claimed:continue
    if state=='QUARANTINED':outcomes.append(state);continue
    try:
     with self.db.transaction():
+     lease=self.db.one("select 1 from integration_commands where source='SHEET' and project_id=? and external_id=? and state='PROCESSING' and lease_owner=? and lease_expires_at>=?",(pid,key,owner,datetime.now(timezone.utc).isoformat()))
+     if not lease:continue
      Pipeline(self.db).decide_scene(pid,str(row.get('scene_code','')),'APPROVED' if action=='APPROVE' else 'REJECTED',str(row.get('actor','sheet')),Role.REVIEWER)
-     self.db.execute("update integration_commands set state='COMPLETED',lease_owner=NULL,lease_expires_at=NULL where source='SHEET' and project_id=? and external_id=?",(pid,key))
+     if self.db.execute("update integration_commands set state='COMPLETED',lease_owner=NULL,lease_expires_at=NULL where source='SHEET' and project_id=? and external_id=? and state='PROCESSING' and lease_owner=?",(pid,key,owner)).rowcount!=1:raise RuntimeError('sheet command lease lost')
     state='COMPLETED';processed+=1
-   except Exception as e:self.db.execute("update integration_commands set state='FAILED',detail=?,lease_owner=NULL where source='SHEET' and project_id=? and external_id=?",(type(e).__name__,pid,key));state='FAILED'
+   except Exception as e:self.db.execute("update integration_commands set state='FAILED',detail=?,lease_owner=NULL,lease_expires_at=NULL where source='SHEET' and project_id=? and external_id=? and state='PROCESSING' and lease_owner=?",(type(e).__name__,pid,key,owner));state='FAILED'
    outcomes.append(state)
   return {'processed':processed,'outcomes':outcomes}
 class DriveAdapter:
@@ -79,7 +82,10 @@ class DriveAdapter:
   if dry_run:return {x:None for x in DRIVE}
   root=retry_call(lambda:self.client.ensure_folder(self.root_id,pid),sleep=self.sleep);return {x:retry_call(lambda n=x:self.client.ensure_folder(root,n),sleep=self.sleep) for x in DRIVE}
  def upload(self,pid,local_path,folder='07_exports',manifest_path=None,dry_run=False):
-  p=Path(local_path);size=p.stat().st_size;digest=hashlib.sha256(p.read_bytes()).hexdigest()
+  p=Path(local_path);size=p.stat().st_size;sha,md5=hashlib.sha256(),hashlib.md5()
+  with p.open('rb') as stream:
+   for chunk in iter(lambda:stream.read(4*1024*1024),b''):sha.update(chunk);md5.update(chunk)
+  digest=sha.hexdigest()
   if dry_run:return {'dry_run':True,'path':str(p),'size':size,'sha256':digest,'actions':['ensure tree','begin/resume','upload chunks','finish','verify checksum','atomic manifest']}
   folders=self.ensure_tree(pid);session,offset=retry_call(lambda:self.client.begin_upload(folders[folder],p.name,size,digest),sleep=self.sleep)
   if not isinstance(offset,int) or not 0<=offset<=size:raise VerificationError('invalid resume offset')
@@ -96,7 +102,7 @@ class DriveAdapter:
   if meta.get('size') is None or int(meta['size'])!=size:raise VerificationError('remote size evidence missing or mismatch')
   remote=meta.get('sha256');algo='sha256'
   if remote is None:remote=meta.get('md5');algo='md5'
-  expected=digest if algo=='sha256' else hashlib.md5(p.read_bytes()).hexdigest()
+  expected=digest if algo=='sha256' else md5.hexdigest()
   if not remote or remote.lower()!=expected:raise VerificationError('remote content checksum unavailable or mismatch')
   result={'local_path':str(p),'remote_id':rid,'size':size,'sha256':digest,'verified':True};target=Path(manifest_path or p.parent/'upload-manifest.json');old=json.loads(target.read_text()) if target.exists() else []
   target.parent.mkdir(parents=True,exist_ok=True);fd,tmp=tempfile.mkstemp(prefix='.'+target.name+'.',dir=target.parent)
