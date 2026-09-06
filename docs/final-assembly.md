@@ -38,6 +38,55 @@ renames without overwrite, then atomically registers `FINAL_VIDEO`,
 already-promoted crash states. Stale output is quarantined; missing/tampered bytes
 and cleanup failures fail closed as auditable `ABORTED`/`MANUAL_REVIEW` states.
 Recovery runs before assembly and is callable with `recover-publications`.
+## F06/F08 evidence and review (uncommitted review candidate)
+
+The v2 input inventory includes ACTIVE scene dependencies, contact sheets and
+referenced ancestors; generated project finals and unrelated retired history are
+excluded. Global execution version remains an exact fence. Assembly input identity
+additionally binds narration URI/hash/duration, ordered selected visuals/frame
+allocation, fixed encoding contract and persisted batch QA/contact-sheet subject.
+Destination, command paths, tool-version observations and FINAL decisions are not
+media input identity. This is conservative same-version reuse, not cross-version
+cache reuse. Tool versions remain recorded as output provenance.
+
+`approve_post_batch` now persists typed QA with its contact-sheet ID/hash and
+approval binding in the append-only event ledger. Missing legacy receipts fail
+assembly closed. Existing approvals are not silently upgraded.
+
+Same-destination real assembly may reuse only a registered ACTIVE final with matching
+input identity and intact manifest. It rehashes actual narration, active scene
+inputs (including the QA image when a clip is selected), contact sheets and output,
+runs fresh final media QA and rechecks gates/input bytes before returning. It never
+allows narration/scene aliases, hardlink aliases or overwriting a stale destination.
+Dry-run remains inspection only; an already-existing destination is rejected rather
+than returning a verified reuse result. Relocation is a new publication, not reuse.
+
+Final review uses two explicit public calls after assembly:
+
+```python
+pipeline.record_final_qa(project_id, artifact_id, QAEvidence(checks, score, evaluator))
+pipeline.review_final(project_id, artifact_id, 'APPROVED', actor)
+```
+
+QA and human review receipts bind current registered FINAL_VIDEO ID/hash, full
+manifest hash, input identity and exact project version. Both calls verify actual
+output media and current input gates/bytes. Recording new QA revokes old FINAL
+approval. The latest persisted passing QA is required for human approval; missing,
+legacy, failed or stale evidence is not inferred. Trusted reviewer submission is
+not proof of an AI-provider invocation. No schema migration is used: receipts live
+in existing append-only events, with approvals retaining their evidence digest.
+Generic PILOT/BATCH/FINAL command decisions now reject as unsupported, including
+`du-final-approve`; they cannot report evidence-free success. Use scene review,
+`approve_post_batch`, and these dedicated final APIs instead.
+
+Summary FINAL validates stored receipt/subject metadata, not live disk bytes.
+Execution/review performs the byte checks. Summary receipt lookup currently uses a
+correlated event subquery; the SELECT-count ceiling is preserved, not a history-size
+or latency guarantee. Further query-shape optimization and broader corruption/race
+hardening require independent review. Existing F07 rerun DAG, full F05 scratch
+ownership, F12 durability and F15 retention policy remain unresolved. No production,
+provider, delivery or exact pen-tip whiteboard acceptance is implied.
+
 ## Atomic publication filesystem requirement
 
 Final publication uses Linux `renameat2(..., RENAME_NOREPLACE)` so a destination

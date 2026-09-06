@@ -71,4 +71,40 @@ checksums, renders IMAGE artifacts explicitly, normalizes each DB-ordered scene 
 1920x1080 H.264/yuv420p at 30 fps, then muxes narration as AAC. Promotion and the
 `FINAL_VIDEO` row occur only after ffprobe verifies both streams. The duration policy
 allows one video frame plus 20 ms for AAC/container timestamp rounding; `-shortest`
-is never used. Matching verified evidence is reused on rerun.
+is never used. Same-input reuse is intended but currently blocked by the audited
+output-alias/input-evidence defects (F06); do not rely on rerun reuse yet.
+
+## Astra remediation status — partial, not production acceptance
+
+The 2026-09-06 remediation fixes F03's nonempty-artifact hash
+projection mismatch. Actual gates and summary now share canonical evidence
+builders. F02/F04 now separate scene-local dependency revisions from global
+execution fencing, and require IMAGE ID/hash-bound QA before human approval.
+Public-API sequential multi-scene approval and local assembly are regression-tested.
+Legacy unbound QA requires fresh QA/approval; see `docs/scene-evidence-v2.md`.
+F01 parent-symlink remediation
+now uses pinned no-follow directory traversal for cleanup, rollback and deletion
+recovery; rename is relative and atomically no-overwrite, unlink is relative,
+and regular-file identity/content are verified. F05 full scratch ownership,
+F06 reuse, F07 rerun dependencies and F08 real final review
+remain outstanding. See `docs/plans/2026-09-06-astra-remediation.md`.
+
+F05 containment added in the continuation: `record_image_attempt` retains every
+caller-supplied `failed_binary`; a managed path alone does not authorize deletion.
+Diagnostic metadata is still recorded. Dedicated scratch ownership receipts and
+journaled retirement remain pending, so failed payloads may accumulate. This does
+not complete F05 or Phase 1.
+
+F01 cleanup commits an append-only `DELETION_PREPARED` event receipt before
+renaming to `.deleting-f01-<token>`; it refuses an enclosing transaction. Recovery
+requires the receipt's inode/owner/content identity for that format. Legacy
+`.deleting-*` recovery requires exact tracked bytes. Unknown bytes, collisions,
+symlinks and mismatched receipts are retained for operator review. Lease checks
+remain inside write transactions; a lost lease leaves recoverable staging. No
+retention classes or TTL were changed. This is not protection against arbitrary
+same-UID writes between the final leaf identity check and the filesystem syscall,
+nor a power-loss durability guarantee.
+
+F15 retention decision is pending: the existing TTL treatment of `FINAL_VIDEO`
+was not changed and differs from protected legacy `FINAL`. Do not infer final
+retention/delivery safety or production readiness from passing regression tests.

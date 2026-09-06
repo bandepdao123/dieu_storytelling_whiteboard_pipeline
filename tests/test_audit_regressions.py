@@ -1,4 +1,5 @@
 import sqlite3
+from qa_helpers import ready_qa
 from datetime import datetime, timezone, timedelta
 
 import pytest
@@ -55,6 +56,7 @@ def pipeline(tmp_path):
 
 def test_source_change_invalidates_and_same_import_is_idempotent(tmp_path):
     db,p,pid=pipeline(tmp_path); scene=p.plan_scenes(pid)[0]
+    ready_qa(p,scene)
     p.decide_scene(pid,scene['code'],'APPROVED','r')
     version=db.one('select version from projects where id=?',(pid,))['version']
     p.import_srt(pid,[(0,6000,'OLD')])
@@ -67,8 +69,8 @@ def test_source_change_invalidates_and_same_import_is_idempotent(tmp_path):
 
 def test_audio_change_deletes_derived_scenes_and_cannot_authorize_batch(tmp_path):
     db,p,pid=pipeline(tmp_path); scene=p.plan_scenes(pid)[0]
-    db.execute("update scenes set state='IMAGE_READY',qa_state='PASS',approval_state='APPROVED' where id=?",(scene['id'],))
-    db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at,evidence_sha256) values(?,?,?,?,?,?,?)",(pid,scene['id'],'SCENE','APPROVED','r','now',p._scene_evidence_hash(scene['id'])))
+    ready_qa(p,scene)
+    p.decide_scene(pid,scene['code'],'APPROVED','r')
     assert p._pilot_ready(pid)
     p.import_audio(pid,'new',6000,'b'*64)
     assert db.one('select 1 from scenes where project_id=?',(pid,)) is None
@@ -77,7 +79,7 @@ def test_audio_change_deletes_derived_scenes_and_cannot_authorize_batch(tmp_path
 
 def test_revoked_scene_approval_cannot_open_batch(tmp_path):
     db,p,pid=pipeline(tmp_path); scene=p.plan_scenes(pid)[0]
-    db.execute("update scenes set state='IMAGE_READY',qa_state='PASS' where id=?",(scene['id'],))
+    ready_qa(p,scene)
     p.decide_scene(pid,scene['code'],'APPROVED','r')
     assert p._pilot_ready(pid)
     db.execute("update approvals set revoked_at='now' where scene_id=?",(scene['id'],))
@@ -187,7 +189,7 @@ class Client:
 
 
 def test_expired_sheet_lease_is_reclaimed(tmp_path):
-    db,p,pid=pipeline(tmp_path); p.plan_scenes(pid)
+    db,p,pid=pipeline(tmp_path); ready_qa(p,p.plan_scenes(pid)[0])
     old=(datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat()
     db.execute("insert into integration_commands values('SHEET','c',?,?,'PROCESSING','old',?,NULL)",(pid,old,old))
     result=SheetsAdapter(Client(),db).ingest_commands(pid)
@@ -232,7 +234,7 @@ def test_restore_artifact_fences_old_jobs_and_downstream_state(tmp_path):
 @pytest.mark.parametrize('mutation', ['qa', 'decision', 'replacement'])
 def test_evidence_mutations_atomically_fence_active_work(tmp_path, mutation):
     db,p,pid=pipeline(tmp_path); scene=p.plan_scenes(pid)[0]
-    db.execute("update scenes set state='IMAGE_READY' where id=?",(scene['id'],))
+    ready_qa(p,scene)
     old_approval=db.execute("insert into approvals(project_id,gate,decision,actor,created_at) values(?,?,?,?,?)",
                             (pid,'POST_BATCH','APPROVED','old','now')).lastrowid
     jid=p._create_job(pid,'ANIMATION')

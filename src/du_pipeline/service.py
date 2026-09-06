@@ -1,13 +1,16 @@
 import hashlib,json,os,uuid,random,shutil
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, closing
 from pathlib import Path
 from datetime import datetime,timezone,timedelta
 from .policies import validate_timing,required_approval,DurationPolicy
 from .contracts import OutputConfig,ContactSheetArtifact,QAEvidence
+from .evidence import (scene_evidence_hash,manifest_evidence_hash,
+ scene_dependency_revision,image_subject,scene_qa_current,scene_approval_current)
 from .policies import ResourceScheduler
 from .adapters import Role,authorize,parse_discord,CommandError
 from .inputs import normalize_document
-from .atomic_fs import rename_noreplace,rename_noreplace_at,open_dir_beneath
+from .atomic_fs import (rename_noreplace,rename_noreplace_at,open_dir_beneath,
+ snapshot_at,assert_identity_at,walk_dirs_at)
 
 def now(): return datetime.now(timezone.utc).isoformat()
 class Pipeline:
@@ -109,6 +112,7 @@ class Pipeline:
   self._event(pid,'DOWNSTREAM_INVALIDATED',{'reason':reason})
  def _invalidate(self,pid,reason,clear_plan=True):
   self._fence_evidence_mutation(pid,reason)
+  self.db.execute("update scenes set qa_state='PENDING',qa_json='{}' where project_id=?",(pid,))
   self.db.execute("update artifacts set status='SUPERSEDED' where project_id=? and status='ACTIVE'",(pid,))
   if clear_plan:
    self.db.execute("update artifacts set scene_id=NULL where project_id=? and scene_id is not null",(pid,))
@@ -120,6 +124,9 @@ class Pipeline:
   if not dry_run: self.reconcile_publications()
   self._active(pid); root=self._root_lookup(pid) if dry_run else self._root(pid)
   if dry_run and not root.is_dir(): raise AssemblyError('managed artifact root is absent')
+  requested=Path(output) if Path(output).is_absolute() else root/Path(output)
+  self._safe_parent(root,requested)
+  if requested.is_symlink(): raise AssemblyError('output symlink alias forbidden')
   out=self._owned_path(pid,output,False,root=root); self._safe_parent(root,out)
   project=self.db.one('select * from projects where id=?',(pid,)); version=project['version']; audio=self.db.one('select * from audio where project_id=?',(pid,))
   if not audio: raise AssemblyError('narration audio required')
@@ -128,13 +135,16 @@ class Pipeline:
   scenes=self.db.all('select * from scenes where project_id=? order by ord',(pid,))
   if not scenes or [s['ord'] for s in scenes]!=list(range(1,len(scenes)+1)): raise AssemblyError('exact ordered scene set required')
   if scenes[0]['start_ms'] or scenes[-1]['end_ms']!=audio['duration_ms'] or any(a['end_ms']!=b['start_ms'] for a,b in zip(scenes,scenes[1:])): raise AssemblyError('scene/audio duration mismatch')
-  # Output is a new publication contract, never an input or historical artifact.
-  aliases=[ap]+[self._owned_path(pid,r['uri'],False) for r in self.db.all('select uri from artifacts where project_id=?',(pid,))]
+  # Only a registered final at its exact canonical destination can be a reuse
+  # candidate. All other names (including hardlink aliases) remain forbidden.
+  candidate=self.db.one("select a.id from artifacts a join final_assemblies f on f.artifact_id=a.id where a.project_id=? and a.kind='FINAL_VIDEO' and a.status='ACTIVE' and a.uri=?",(pid,str(out)))
+  aliases=[ap]+[self._owned_path(pid,r['uri'],False) for r in self.db.all('select id,uri from artifacts where project_id=?',(pid,)) if not candidate or r['id']!=candidate['id']]
   if any(out==p or (out.exists() and p.exists() and os.path.samefile(out,p)) for p in aliases): raise AssemblyError('output aliases managed input/artifact')
+  gate_artifacts=self.db.all('select * from artifacts where project_id=?',(pid,))
+  gate_approvals=self.db.all('select * from approvals where project_id=? order by gate,scene_id,id',(pid,))
   selected=[]; frame_total=round(audio['duration_ms']*30/1000)
   for s in scenes:
    if s['state'] not in ('IMAGE_READY','ANIMATED') or s['qa_state']!='PASS' or s['approval_state'] in ('REQUIRED','REJECTED'): raise AssemblyError('scene QA/approval gate failed')
-   if s['approval_state']=='APPROVED' and not self.db.one("select 1 from approvals where project_id=? and scene_id=? and gate='SCENE' and decision='APPROVED' and revoked_at is null and project_version=? and evidence_sha256=?",(pid,s['id'],version,self._scene_evidence_hash(s['id']))): raise AssemblyError('stale scene approval evidence')
    rows=self.db.all("select * from artifacts where scene_id=? and status='ACTIVE' and kind in ('ANIMATION','SCENE_VIDEO','IMAGE') order by version desc,id",(s['id'],))
    videos=[a for a in rows if a['kind'] in ('ANIMATION','SCENE_VIDEO')]; pool=videos or [a for a in rows if a['kind']=='IMAGE']
    if not pool: raise AssemblyError('exactly one eligible current scene artifact required')
@@ -142,16 +152,42 @@ class Pipeline:
    a=pool[0]; path=self._owned_path(pid,a['uri']); frames=round(s['end_ms']*30/1000)-round(s['start_ms']*30/1000)
    if frames < 1: raise AssemblyError('scene rounds to zero frames')
    if self._hash(path)[0]!=a['sha256']: raise AssemblyError('scene artifact checksum mismatch')
+   if not scene_qa_current(project,s,gate_artifacts): raise AssemblyError('scene QA subject/dependency gate failed')
+   if (s['approval_state']=='APPROVED' or s['ord']<=5 or s['special']) and not scene_approval_current(project,s,gate_artifacts,gate_approvals): raise AssemblyError('stale scene approval evidence')
    selected.append((s,a,path,a['kind']=='IMAGE',frames))
   if sum(x[4] for x in selected)!=frame_total: raise AssemblyError('frame allocation mismatch')
+  # QA subjects and contact sheets remain relevant even when a clip is selected.
+  for dependency in gate_artifacts:
+   if dependency['status']=='ACTIVE' and (dependency['scene_id'] is not None or dependency['kind']=='CONTACT_SHEET'):
+    if self._hash(self._owned_path(pid,dependency['uri']))[0]!=dependency['sha256']: raise AssemblyError('input dependency checksum mismatch')
   engine=assembler or LocalFinalAssembler(root); current_evidence=self._manifest_hash(pid)
-  approvals=[dict(x) for x in self.db.all("select id,gate,scene_id,actor,project_version,evidence_sha256 from approvals where project_id=? and decision='APPROVED' and revoked_at is null and project_version=? order by gate,scene_id,id",(pid,version))]
+  current_scenes={s['id'] for s in scenes if scene_approval_current(project,s,gate_artifacts,gate_approvals)}
+  approvals=[{k:a[k] for k in ('id','gate','scene_id','actor','project_version','evidence_sha256')} for a in gate_approvals if a['decision']=='APPROVED' and a['revoked_at'] is None and ((a['gate']=='SCENE' and a['scene_id'] in current_scenes) or (a['gate']!='SCENE' and a['project_version']==version))]
   if not any(a['gate']=='POST_BATCH' and a['scene_id'] is None and a['evidence_sha256']==current_evidence for a in approvals): raise AssemblyError('current post-batch human approval required')
   lineage=[{'type':'NARRATION_AUDIO','sha256':ah}]+[{'type':'SCENE_VISUAL','ord':s['ord'],'artifact_id':a['id'],'sha256':a['sha256']} for s,a,_,_,_ in selected]
   manifest={'project_id':pid,'project_version':version,'current_evidence_sha256':current_evidence,'requested_output':str(out),'narration':{'uri':str(ap),'sha256':ah,'duration_ms':audio['duration_ms']},'audio':{'sha256':ah,'duration_ms':audio['duration_ms']},'approvals':approvals,'parent_lineage':lineage,'scenes':[{'scene_id':s['id'],'ord':s['ord'],'source_artifact_id':a['id'],'source_kind':a['kind'],'source_version':a['version'],'parent_id':a['parent_id'],'sha256':a['sha256'],'frames':frames} for s,a,_,_,frames in selected],'output_config':{'width':1920,'height':1080,'fps':30,'video_codec':'h264','pixel_format':'yuv420p','audio_codec':'aac','tolerance_seconds':1/30+.020},'tool_versions':None if dry_run else engine.tool_versions()}
-  evidence=hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',',':')).encode()).hexdigest(); manifest['input_evidence_sha256']=evidence
+  identity={k:v for k,v in manifest.items() if k not in ('requested_output','tool_versions','approvals')}
+  batch_row=self.db.one("select data_json from events where project_id=? and type='POST_BATCH_QA_RECORDED' order by id desc limit 1",(pid,))
+  batch_qa=json.loads(batch_row['data_json']) if batch_row else {}
+  if batch_qa.get('schema_version')!=2 or batch_qa.get('evidence_sha256')!=current_evidence or batch_qa.get('project_version')!=version or not any(a['id']==batch_qa.get('approval_id') and a['gate']=='POST_BATCH' for a in approvals): raise AssemblyError('current persisted post-batch QA required')
+  if not QAEvidence(batch_qa['checks'],batch_qa['score'],batch_qa['evaluator']).passed or not any(a['id']==batch_qa['subject']['artifact_id'] and a['sha256']==batch_qa['subject']['sha256'] and a['kind']=='CONTACT_SHEET' and a['status']=='ACTIVE' for a in gate_artifacts): raise AssemblyError('post-batch QA subject mismatch')
+  identity['batch_qa']=batch_qa
+  identity['schema_version']=2
+  evidence=hashlib.sha256(json.dumps(identity,sort_keys=True,separators=(',',':')).encode()).hexdigest(); manifest['input_evidence_sha256']=evidence; manifest['input_identity']=identity
   old=self.db.one("select a.*,f.manifest_json from artifacts a join final_assemblies f on f.artifact_id=a.id where f.evidence_sha256=? and a.status='ACTIVE'",(evidence,))
-  if old and Path(old['uri']).resolve()==out and self._hash(self._owned_path(pid,old['uri']))[0]==old['sha256']: return {'artifact_id':old['id'],'output':old['uri'],'reused':True,'manifest':json.loads(old['manifest_json'])}
+  if not dry_run and old and Path(old['uri']).resolve()==out and self._hash(self._owned_path(pid,old['uri']))[0]==old['sha256']:
+   from .evidence import digest
+   saved=json.loads(old['manifest_json'])
+   if saved.get('input_identity')!=identity or digest({k:v for k,v in saved.items() if k!='manifest_sha256'})!=saved.get('manifest_sha256'): raise AssemblyError('legacy or invalid reuse manifest')
+   engine.validate_final(out,audio['duration_ms']/1000)
+   if self._hash(out)[0]!=old['sha256']: raise AssemblyError('output changed during reuse QA')
+   with self.db.transaction():
+    self._active(pid)
+    if self._manifest_hash(pid)!=current_evidence or not self.db.one("select 1 from artifacts where id=? and status='ACTIVE' and sha256=?",(old['id'],old['sha256'])): raise AssemblyError('project/evidence changed during reuse')
+    if not dry_run:
+     fresh=self.assemble(pid,root/('.verify-'+uuid.uuid4().hex+'.mp4'),dry_run=True,assembler=engine)
+     if fresh['manifest']['input_evidence_sha256']!=evidence: raise AssemblyError('input identity changed during reuse')
+   return {'artifact_id':old['id'],'output':old['uri'],'reused':True,'manifest':json.loads(old['manifest_json'])}
   if out.exists(): raise AssemblyError('output already exists')
   commands=[engine.normalize_command(path,root/f'.segment-{i}.mp4',frames/30,image,frames=frames) for i,(s,a,path,image,frames) in enumerate(selected)]; commands += [engine.concat_command(root/'.concat.txt',root/'.visual.mp4'),engine.mux_command(root/'.visual.mp4',ap,root/'.final.tmp.mp4')]; manifest['commands']=commands
   if dry_run:
@@ -286,7 +322,7 @@ class Pipeline:
   old=self.db.one("select value_json from learning_metadata where project_id=? and key='normalized_input' order by id desc limit 1",(pid,))
   if old and old['value_json']==canonical:return normalized
   with self.db.transaction():
-   if old:self._invalidate(pid,'document changed')
+   if old or self.db.one('select 1 from scenes where project_id=?',(pid,)):self._invalidate(pid,'document changed')
    self.db.execute("insert into learning_metadata(project_id,key,value_json,created_at) values(?,?,?,?)",(pid,'normalized_input',canonical,now()))
    self._event(pid,'SCRIPT_SOURCE_IMPORTED',{'kind':kind})
   return normalized
@@ -319,40 +355,69 @@ class Pipeline:
    self._event(pid,"SCENES_PLANNED",{"count":len(planned)}); self.checkpoint(pid,'plan',{'count':len(planned)},role)
   return [dict(x) for x in self.db.all("select * from scenes where project_id=? order by ord",(pid,))]
  def scene(self,sid): return dict(self.db.one("select * from scenes where id=?",(sid,)))
+ def _attempt_epoch(self,pid):
+  return self.db.one("select coalesce(max(id),0) epoch from events where project_id=? and type='IMAGE_EPOCH_STARTED'",(pid,))['epoch']
+ def _attempt_count(self,sid):
+  s=self.scene(sid); epoch=self._attempt_epoch(s['project_id'])
+  return self.db.one('select count(*) n from attempts where project_id=? and scene_code=? and epoch=?',(s['project_id'],s['code'],epoch))['n']
  def queue_retry(self,sid,role=Role.OPERATOR):
   self._role(role,'retry'); s=self.db.one('select * from scenes where id=?',(sid,)); self._active(s['project_id'])
-  if self.db.one('select count(*) n from attempts where scene_id=?',(sid,))['n']>=3: raise ValueError('maximum 3 attempts')
+  if self._attempt_count(sid)>=3: raise ValueError('maximum 3 attempts')
   with self.db.transaction():
    if self.db.execute("update scenes set state='RETRY_QUEUED' where id=? and state in ('RETRYABLE','BLOCKED')",(sid,)).rowcount!=1: raise PermissionError('illegal retry transition')
    self._create_job(s['project_id'],f'RETRY_IMAGE:{sid}')
   return self.scene(sid)
- def record_image_attempt(self,sid,success,failed_binary=None,error=None,provider="codex-gpt-image-2",role=Role.OPERATOR):
+ def allocate_attempt_scratch(self,sid,payload,role=Role.OPERATOR):
+  from .scratch import allocate
+  self._role(role,'retry'); return allocate(self,sid,payload)
+ def _scratch_crash(self,point): pass
+ def record_image_attempt(self,sid,success,failed_binary=None,error=None,provider="codex-gpt-image-2",role=Role.OPERATOR,*,scratch_receipt=None):
+  from .scratch import consume
   self._role(role,'retry')
-  scene=self.db.one("select * from scenes where id=?",(sid,))
-  if not scene: raise ValueError('scene not found')
-  self._active(scene['project_id'])
-  n=self.db.one("select count(*) n from attempts where scene_id=?",(sid,))['n']+1
-  if n>3: raise ValueError('maximum 3 attempts')
-  if scene['state'] not in ('PLANNED','RETRY_QUEUED','RETRYABLE'): raise PermissionError('illegal image attempt transition')
-  if scene['ord']>5 and not scene['special'] and not self._pilot_ready(scene['project_id']): raise PermissionError('pilot approval required before batch images')
-  path=digest=size=None
-  if failed_binary and os.path.isfile(failed_binary):
-   try: owned=self._owned_path(scene['project_id'],failed_binary)
-   except PermissionError: owned=None
-   if owned: path=str(owned); digest,size=self._hash(owned)
-  state="SUCCEEDED" if success else "FAILED"
+  if scratch_receipt and self.db._tx_depth: raise RuntimeError('scratch consumption requires an independent journal transaction')
+  if scratch_receipt and failed_binary is not None: raise ValueError('choose scratch receipt or diagnostic path')
   with self.db.transaction():
-   self.db.execute("insert into attempts(scene_id,number,provider,state,error,failed_path,failed_sha256,failed_size,created_at) values(?,?,?,?,?,?,?,?,?)",(sid,n,provider,state,error,path,digest,size,now()))
-   self.db.execute("update scenes set state=?,checkpoint_json=? where id=?",("IMAGE_READY" if success else ("BLOCKED" if n==3 else "RETRYABLE"),json.dumps({'attempt':n}),sid)); self._event(scene['project_id'],"IMAGE_ATTEMPT",{"scene":scene['code'],"number":n,"state":state})
-  if path: Path(path).unlink(missing_ok=True)
+   scene=self.db.one("select * from scenes where id=?",(sid,))
+   if not scene: raise ValueError('scene not found')
+   self._active(scene['project_id']); n=self._attempt_count(sid)+1
+   if n>3: raise ValueError('maximum 3 attempts')
+   if scene['state'] not in ('PLANNED','RETRY_QUEUED','RETRYABLE'): raise PermissionError('illegal image attempt transition')
+   if scene['ord']>5 and not scene['special'] and not self._pilot_ready(scene['project_id']): raise PermissionError('pilot approval required before batch images')
+   path=digest=size=None
+   if scratch_receipt:
+    receipt=consume(self,scene,n,scratch_receipt,success)
+    path,digest,size=receipt['path'],receipt['sha256'],receipt['size']
+   elif failed_binary:
+    # Diagnostic only: pinned no-follow regular-file reads, never deletion.
+    try:
+     fd,name=self._publication_parent_fd(scene['project_id'],failed_binary)
+     try:
+      identity,digest=snapshot_at(fd,name); size=identity[5]
+      candidate=Path(failed_binary); path=str(candidate if candidate.is_absolute() else self._root_lookup(scene['project_id'])/candidate)
+     finally: os.close(fd)
+    except (OSError,ValueError): path=digest=size=None
+   state="SUCCEEDED" if success else "FAILED"
+   aid=self.db.execute("insert into attempts(scene_id,number,provider,state,error,failed_path,failed_sha256,failed_size,created_at,project_id,scene_code,epoch) values(?,?,?,?,?,?,?,?,?,?,?,?)",(sid,n,provider,state,error,path,digest,size,now(),scene['project_id'],scene['code'],self._attempt_epoch(scene['project_id']))).lastrowid
+   self.db.execute("update scenes set state=?,checkpoint_json=? where id=?",("IMAGE_READY" if success else ("BLOCKED" if n==3 else "RETRYABLE"),json.dumps({'attempt':n}),sid)); self._event(scene['project_id'],"IMAGE_ATTEMPT",{"scene":scene['code'],"number":n,"state":state,'epoch':self._attempt_epoch(scene['project_id']),'attempt_id':aid})
+   if scratch_receipt:self._event(scene['project_id'],'SCRATCH_CONSUMED',{'token':scratch_receipt,'attempt_id':aid,'success':bool(success)})
+  if scratch_receipt:
+   self._scratch_crash('after_attempt_commit')
+   self.reconcile_deletions()
  def record_scene_qa(self,sid,evidence,role=Role.REVIEWER):
   self._role(role,'approve')
   if not isinstance(evidence,QAEvidence): raise TypeError('QAEvidence required')
-  s=self.db.one('select * from scenes where id=?',(sid,)); self._active(s['project_id'])
-  if s['state']!='IMAGE_READY': raise PermissionError('QA requires ready image')
-  payload={'checks':dict(evidence.checks),'score':evidence.score,'evaluator':evidence.evaluator}
   with self.db.transaction():
+   s=self.db.one('select * from scenes where id=?',(sid,)); self._active(s['project_id'])
+   if s['state']!='IMAGE_READY': raise PermissionError('QA requires ready image')
+   project=self.db.one('select * from projects where id=?',(s['project_id'],))
+   artifacts=self.db.all('select * from artifacts where scene_id=?',(sid,))
+   subject=image_subject(s,artifacts)
+   if subject is None: raise PermissionError('QA requires exactly one current IMAGE artifact')
+   artifact=next(a for a in artifacts if a['id']==subject['artifact_id'])
+   if self._hash(self._owned_path(s['project_id'],artifact['uri']))[0]!=subject['sha256']: raise PermissionError('QA image checksum mismatch')
+   payload={'schema_version':2,'subject':subject,'dependency_revision':scene_dependency_revision(project,s),'checks':dict(evidence.checks),'score':evidence.score,'evaluator':evidence.evaluator}
    self._fence_evidence_mutation(s['project_id'],'QA evidence changed',scene_id=sid)
+   self.db.execute("update artifacts set status='SUPERSEDED' where project_id=? and status='ACTIVE' and ((scene_id=? and kind in ('ANIMATION','SCENE_VIDEO')) or kind in ('FINAL_VIDEO','CONTACT_SHEET'))",(s['project_id'],sid))
    self.db.execute("update scenes set qa_state=?,qa_json=? where id=?",('PASS' if evidence.passed else 'FAIL',json.dumps(payload),sid))
  def _planned_ready(self,pid):
   """Require persisted, internally valid source timing and a complete scene plan."""
@@ -363,13 +428,15 @@ class Pipeline:
   return project['min_scenes']<=len(scenes)<=project['max_scenes'] and [x['ord'] for x in scenes]==list(range(1,len(scenes)+1))
  def _scene_evidence_hash(self,sid):
   s=dict(self.db.one('select id,project_id,code,ord,start_ms,end_ms,text,special,state,qa_state,qa_json,duration_exception,continuity_json,checkpoint_json from scenes where id=?',(sid,)))
-  artifacts=[dict(x) for x in self.db.all("select id,kind,sha256,version,parent_id,status from artifacts where scene_id=? and status='ACTIVE' order by id",(sid,))]
-  return hashlib.sha256(json.dumps({'scene':s,'artifacts':artifacts},sort_keys=True,separators=(',',':')).encode()).hexdigest()
+  artifacts=[dict(x) for x in self.db.all("select id,scene_id,kind,sha256,version,parent_id,status from artifacts where scene_id=? and status='ACTIVE' order by id",(sid,))]
+  return scene_evidence_hash(s,artifacts)
  def _pilot_ready(self,pid):
   if not self._planned_ready(pid): return False
+  project=self.db.one('select * from projects where id=?',(pid,))
+  artifacts=self.db.all('select * from artifacts where project_id=?',(pid,))
+  approvals=self.db.all('select * from approvals where project_id=?',(pid,))
   for s in self.db.all("select * from scenes where project_id=? and (ord<=5 or special=1)",(pid,)):
-   if s['state']!='IMAGE_READY' or s['qa_state']!='PASS' or s['approval_state']!='APPROVED': return False
-   if not self.db.one("select 1 from approvals where project_id=? and scene_id=? and gate='SCENE' and decision='APPROVED' and revoked_at is null and evidence_sha256=?",(pid,s['id'],self._scene_evidence_hash(s['id']))): return False
+   if not scene_approval_current(project,s,artifacts,approvals): return False
   return True
  def start_batch(self,pid,role=Role.OPERATOR):
   self._role(role,'batch')
@@ -381,16 +448,21 @@ class Pipeline:
   if not isinstance(ai_qa,QAEvidence) or not ai_qa.passed or not contact_sheet or not os.path.isfile(contact_sheet): raise ValueError('typed AI QA evidence and persisted contact sheet required')
   if self.db.one("select 1 from scenes where project_id=? and (state!='IMAGE_READY' or qa_state!='PASS')",(pid,)): raise PermissionError('complete batch and every scene QA PASS required')
   with self.db.transaction():
+   project=self.db.one('select * from projects where id=?',(pid,))
+   artifacts=self.db.all('select * from artifacts where project_id=?',(pid,))
+   if not self._pilot_ready(pid) or any(not scene_qa_current(project,s,artifacts) for s in self.db.all('select * from scenes where project_id=?',(pid,))): raise PermissionError('current scene QA/approval required')
    # Gate authorization above permits the trusted workflow to ingest its evidence.
    aid=self.add_artifact(pid,'CONTACT_SHEET',contact_sheet,role=Role.OWNER)
    version=self.db.one('select version from projects where id=?',(pid,))['version']; evidence=self._manifest_hash(pid)
-   self.db.execute("insert into approvals(project_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,?,?,?,?,?,?)",(pid,'POST_BATCH','APPROVED',actor,now(),version,evidence))
+   approval=self.db.execute("insert into approvals(project_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,?,?,?,?,?,?)",(pid,'POST_BATCH','APPROVED',actor,now(),version,evidence)).lastrowid
+   artifact=self.db.one('select sha256 from artifacts where id=?',(aid,))
+   self._event(pid,'POST_BATCH_QA_RECORDED',{'schema_version':2,'approval_id':approval,'project_version':version,'evidence_sha256':evidence,'subject':{'artifact_id':aid,'sha256':artifact['sha256']},'checks':ai_qa.checks,'score':ai_qa.score,'evaluator':ai_qa.evaluator})
   a=self.db.one('select * from artifacts where id=?',(aid,)); return ContactSheetArtifact(a['id'],a['project_id'],a['uri'],a['sha256'],a['version'],a['status'])
  def _manifest_hash(self,pid):
   project=dict(self.db.one('select language,style_json,references_json,bible_json,image_provider,whiteboard_mode,seed,transition,min_scenes,max_scenes,output_json,version from projects where id=?',(pid,)))
   scenes=[dict(x) for x in self.db.all('select id,code,ord,start_ms,end_ms,text,special,state,approval_state,qa_state,qa_json,duration_exception,continuity_json,checkpoint_json from scenes where project_id=? order by ord',(pid,))]
   artifacts=[dict(x) for x in self.db.all('select id,scene_id,kind,sha256,version,parent_id,status from artifacts where project_id=? order by id',(pid,))]
-  return hashlib.sha256(json.dumps({'project':project,'scenes':scenes,'artifacts':artifacts},sort_keys=True,separators=(',',':')).encode()).hexdigest()
+  return manifest_evidence_hash(project,scenes,artifacts)
  def start_animation(self,pid,role=Role.OPERATOR):
   self._role(role,'animate')
   if not self._planned_ready(pid): raise PermissionError('valid audio/SRT and at least one planned scene required')
@@ -428,7 +500,7 @@ class Pipeline:
    kind,sid=admitted
    try:
     sequence=iter(outcomes.get(sid,(True,)))
-    while self.db.one('select count(*) n from attempts where scene_id=?',(sid,))['n']<3:
+    while self._attempt_count(sid)<3:
      try: success=bool(next(sequence))
      except StopIteration: break
      self.record_image_attempt(sid,success,error=None if success else 'fake failure')
@@ -445,24 +517,72 @@ class Pipeline:
    snapshot={**data,**payload,'snapshot_sha256':hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()}
    self.db.execute("insert into stages(job_id,name,state,checkpoint_json) values(?,?,?,?) on conflict(job_id,name) do update set state=excluded.state,checkpoint_json=excluded.checkpoint_json",(jid,stage,'SUCCEEDED',json.dumps(snapshot)))
  def propose_rerun(self,pid,stage,role=Role.OPERATOR): self._role(role,'retry'); return self.db.execute("insert into proposals(project_id,stage,state,created_at) values(?,?,?,?)",(pid,stage,'PROPOSED',now())).lastrowid
- def decide_rerun(self,i,approved,actor,role=Role.OWNER):
-  self._role(role,'approve')
-  if self.db.execute("update proposals set state=?,actor=? where id=? and state='PROPOSED'",('APPROVED' if approved else 'REJECTED',actor,i)).rowcount!=1: raise PermissionError('illegal rerun decision')
- def apply_rerun(self,i,role=Role.OWNER):
-  self._role(role,'dependency')
-  p=self.db.one('select * from proposals where id=?',(i,))
-  if not p or p['state']!='APPROVED': raise PermissionError('rerun approval required')
-  order=['planning','image','qa','animation','assembly','upload']; stage={'plan':'planning'}.get(p['stage'],p['stage'])
-  if stage not in order: raise ValueError('unknown stage')
-  downstream=order[order.index(stage):]
+ def _rerun_decision(self,p):
+  # Read newest first: never fall back from a stale/invalid decision to an old grant.
+  for row in self.db.all("select * from events where project_id=? and type='RERUN_DECIDED' order by id desc",(p['project_id'],)):
+   try:
+    data=json.loads(row['data_json'])
+    if not isinstance(data,dict) or type(data.get('proposal_id')) is not int: raise ValueError('invalid receipt')
+   except (ValueError,TypeError) as exc: raise PermissionError('invalid rerun decision provenance') from exc
+   if data['proposal_id']==p['id']: return row,data
+  return None,None
+ def decide_rerun(self,i,approved,actor,role=Role.OWNER,*,reapprove=False):
+  self._role(role,'dependency')  # OWNER-only, unlike generic scene approval.
+  if type(approved) is not bool or type(reapprove) is not bool: raise ValueError('boolean rerun decision required')
+  if not isinstance(actor,str) or not actor.strip(): raise ValueError('rerun decision actor required')
   with self.db.transaction():
-   self.db.execute("update jobs set state='BLOCKED',updated_at=? where project_id=? and state in ('QUEUED','RUNNING','PAUSED')",(now(),p['project_id']))
-   arts=self.db.all("select * from artifacts where project_id=? and status='ACTIVE'",(p['project_id'],))
-   for a in arts:
-    if a['kind'].lower() in downstream:self.db.execute("update artifacts set status='SUPERSEDED' where id=?",(a['id'],))
-   self.db.execute("update projects set version=version+1 where id=?",(p['project_id'],))
+   p=self.db.one('select * from proposals where id=?',(i,))
+   expected='APPROVED' if reapprove else 'PROPOSED'
+   if not p or p['state']!=expected: raise PermissionError('illegal rerun decision; pending approvals require explicit reapprove=True')
+   previous,unused=self._rerun_decision(p)
+   version=self.db.one('select version from projects where id=?',(p['project_id'],))['version']
+   if self.db.execute('update proposals set state=?,actor=? where id=? and state=?',('APPROVED' if approved else 'REJECTED',actor,i,expected)).rowcount!=1: raise PermissionError('illegal rerun decision')
+   decided=dict(self.db.one('select * from proposals where id=?',(i,)))
+   self._event(p['project_id'],'RERUN_DECIDED',{'format':'rerun-decision-v1','proposal_id':i,'proposal':decided,'role':Role.OWNER.value,'project_version':version,'previous_proposal':dict(p),'previous_decision_event_id':previous['id'] if previous else None})
+ def apply_rerun(self,i,role=Role.OWNER):
+  from .dependencies import IMPACT,Stage,normalize_stage,job_stage
+  self._role(role,'dependency')
+  with self.db.transaction():
+   p=self.db.one('select * from proposals where id=?',(i,))
+   if not p or p['state']!='APPROVED': raise PermissionError('rerun approval required')
+   stage=normalize_stage(p['stage']); impact=IMPACT[stage]; pid=p['project_id']; self._active(pid)
+   receipt,decision=self._rerun_decision(p)
+   version=self.db.one('select version from projects where id=?',(pid,))['version']
+   if (not receipt or decision.get('format')!='rerun-decision-v1' or decision.get('role')!=Role.OWNER.value
+       or decision.get('proposal')!=dict(p) or type(decision.get('project_version')) is not int
+       or decision['project_version']!=version or not isinstance(p['actor'],str) or not p['actor'].strip()):
+    raise PermissionError('current OWNER rerun decision provenance required; explicitly reapprove pending proposal')
+   decision_id=receipt['id']
    if self.db.execute("update proposals set state='APPLIED' where id=? and state='APPROVED'",(i,)).rowcount!=1: raise PermissionError('rerun already applied')
-   return self._create_job(p['project_id'],'RERUN:'+stage)
+   # All old-version execution is fenced, including unknown job kinds. Typed
+   # descendants are reported separately; never relabel historical jobs as new.
+   jobs=self.db.all("select id,kind from jobs where project_id=? and state in ('QUEUED','RUNNING','PAUSED')",(pid,))
+   for job in jobs:
+    if stage!=Stage.UPLOAD or job_stage(job['kind']) in impact.jobs:
+     self.db.execute("update jobs set state='BLOCKED',updated_at=?,lease_owner=NULL,lease_expires_at=NULL where id=?",(now(),job['id']))
+   retired=[]
+   for a in self.db.all("select id,kind from artifacts where project_id=? and status='ACTIVE'",(pid,)):
+    if a['kind'] in impact.artifacts:
+     self.db.execute("update artifacts set status='SUPERSEDED' where id=?",(a['id'],)); retired.append(a['id'])
+   gates=set(impact.approvals)
+   # Scene approval binds its active clips/state: retire it only where that
+   # local evidence actually changed, without discarding IMAGE subject QA.
+   if stage==Stage.ANIMATION:
+    for s in self.db.all('select * from scenes where project_id=?',(pid,)):
+     changed=s['state']=='ANIMATED' or self.db.one('select 1 from artifacts where scene_id=? and id in (%s)' % (','.join('?' for _ in retired) or 'NULL'),(s['id'],*retired))
+     if changed:
+      self.db.execute("update approvals set revoked_at=?,revoked_reason='animation rerun' where scene_id=? and gate='SCENE' and revoked_at is null",(now(),s['id']))
+      self.db.execute("update scenes set state='IMAGE_READY',approval_state=case when special=1 or ord<=5 then 'REQUIRED' else 'NOT_REQUIRED' end where id=?",(s['id'],))
+   for gate in gates:
+    self.db.execute("update approvals set revoked_at=?,revoked_reason=? where project_id=? and gate=? and revoked_at is null",(now(),'rerun:'+stage.value,pid,gate))
+   if impact.reset_qa:
+    self.db.execute("update scenes set qa_state='PENDING',qa_json='{}',approval_state=case when special=1 or ord<=5 then 'REQUIRED' else 'NOT_REQUIRED' end,state=case when state='ANIMATED' then 'IMAGE_READY' else state end where project_id=?",(pid,))
+   if impact.new_epoch:
+    self._event(pid,'IMAGE_EPOCH_STARTED',{'proposal_id':i,'decision_event_id':decision_id,'stage':stage.value,'budget':3})
+    self.db.execute("update scenes set state='PLANNED',checkpoint_json='{}' where project_id=?",(pid,))
+   if stage!=Stage.UPLOAD:self.db.execute('update projects set version=version+1 where id=?',(pid,))
+   self._event(pid,'RERUN_APPLIED',{'proposal_id':i,'decision_event_id':decision_id,'stage':stage.value,'artifacts':retired,'approval_gates':sorted(gates),'dependent_jobs':[j['id'] for j in jobs if job_stage(j['kind']) in impact.jobs],'execution_fence':stage!=Stage.UPLOAD})
+   return self._create_job(pid,'RERUN:'+stage.value)
  def add_artifact(self,pid,kind,uri,scene_id=None,parent_id=None,role=Role.OPERATOR,_new_copies=None):
   self._role(role,'scene-replace'); source=Path(uri).resolve(strict=True); root=self._root(pid)
   # Ingest into owned storage; callers' arbitrary source URI is never later deleted.
@@ -477,6 +597,10 @@ class Pipeline:
    digest,_=self._hash(managed); version=self.db.one("select coalesce(max(version),0)+1 v from artifacts where project_id=? and kind=? and scene_id is ?",(pid,kind,scene_id))['v']; days=self.db.one('select retention_days from projects where id=?',(pid,))['retention_days']; expires=(datetime.now(timezone.utc)+timedelta(days=days)).isoformat()
    with self.db.transaction():
     aid=self.db.execute("insert into artifacts(project_id,scene_id,kind,uri,sha256,version,parent_id,status,created_at,expires_at) values(?,?,?,?,?,?,?,?,?,?)",(pid,scene_id,kind,str(managed),digest,version,parent_id,"ACTIVE",now(),expires)).lastrowid
+    if kind=='IMAGE' and scene_id is not None:
+     self._fence_evidence_mutation(pid,'image subject changed',scene_id=scene_id)
+     self.db.execute("update scenes set qa_state='PENDING',qa_json='{}',state=case when state='ANIMATED' then 'IMAGE_READY' else state end where id=?",(scene_id,))
+     self.db.execute("update artifacts set status='SUPERSEDED' where project_id=? and status='ACTIVE' and ((scene_id=? and kind in ('ANIMATION','SCENE_VIDEO')) or kind in ('FINAL_VIDEO','CONTACT_SHEET'))",(pid,scene_id))
     self._event(pid,'ARTIFACT_ADDED',{'artifact':aid,'kind':kind})
    return aid
   except Exception:
@@ -500,94 +624,131 @@ class Pipeline:
   try:return self._cleanup(token)
   finally:
    if owned:self.db.release_reconciliation_lease(token)
+ def _deletion_live(self,uri):
+  # URI ownership is global, not just the retiring project's view.
+  return (self.db.one("select 1 from artifacts where uri=? and status!='DELETED' limit 1",(uri,))
+          or self.db.one('select 1 from audio where uri=? limit 1',(uri,)))
+ def _deletion_snapshot(self,fd,name):
+  try:return snapshot_at(fd,name)
+  except FileNotFoundError:return None
+ def _deletion_move(self,fd,source,destination,identity):
+  assert_identity_at(fd,source,identity)
+  rename_noreplace_at(fd,source,fd,destination)
+  # Never destroy a leaf substituted between verification and rename.
+  assert_identity_at(fd,destination,identity)
+ def _deletion_unlink(self,fd,name,identity):
+  assert_identity_at(fd,name,identity)
+  os.unlink(name,dir_fd=fd)
  def _cleanup(self,token):
+  if self.db._tx_depth: raise RuntimeError('cleanup requires an independent journal transaction')
   immutable=('INPUT','MANIFEST','DB','PROMPT','BIBLE','QA_METADATA','CHECKSUM','FINAL')
   rows=self.db.all("select * from artifacts where status in ('ACTIVE','SUPERSEDED') and expires_at<? and upper(kind) not in (%s)" % ','.join('?'*len(immutable)),(now(),*immutable))
   count=0
   for r in rows:
-   try: path=self._owned_path(r['project_id'],r['uri'],must_exist=False)
-   except (PermissionError,OSError): continue
-   staged=path.with_name(path.name+'.deleting-'+uuid.uuid4().hex)
+   try: fd,name=self._publication_parent_fd(r['project_id'],r['uri'])
+   except (ValueError,OSError): continue
+   staged=name+'.deleting-f01-'+uuid.uuid4().hex
    moved=False
    try:
-    # BEGIN IMMEDIATE serializes the row transition, shared-reference decision,
-    # and rename.  A waiter therefore observes either the live reference or the
-    # committed DELETED transition, never the old decision with the new state.
-    with self.db.transaction():
-     self.db.assert_reconciliation_lease(token)
-     changed=self.db.execute("update artifacts set status='DELETED',deleted_at=? where id=? and status=?",(now(),r['id'],r['status'])).rowcount
-     if not changed: continue # another cleanup connection already retired it
-     live=self.db.one("select 1 from artifacts where project_id=? and uri=? and status!='DELETED' limit 1",(r['project_id'],r['uri']))
-     if not live and path.is_file() and not path.is_symlink():
-      path.replace(staged); moved=True
-   except Exception:
-    # A rename followed by rollback represents a live DB reference again.
-    if moved and staged.is_file() and not staged.is_symlink() and not path.exists(): staged.replace(path)
-    raise
-   if moved: staged.unlink(missing_ok=True)
-   count+=1
+    try: before=self._deletion_snapshot(fd,name)
+    except OSError: continue
+    if before and before[1]!=r['sha256']: continue
+    # Append-only durable ownership receipt BEFORE the rename transaction.
+    # It survives rollback/crash; artifact status remains the decision authority.
+    if before:
+     with self.db.transaction():
+      self.db.assert_reconciliation_lease(token)
+      self._event(r['project_id'],'DELETION_PREPARED',{'uri':r['uri'],'staged':staged,'identity':before[0],'sha256':before[1],'artifact':r['id']})
+    try:
+     with self.db.transaction():
+      self.db.assert_reconciliation_lease(token)
+      current=self.db.one('select * from artifacts where id=?',(r['id'],))
+      if not current or any(current[k]!=r[k] for k in ('uri','sha256','status','expires_at')): continue
+      changed=self.db.execute("update artifacts set status='DELETED',deleted_at=? where id=? and status=?",(now(),r['id'],r['status'])).rowcount
+      if not changed: continue
+      if before and not self._deletion_live(r['uri']):
+       self._deletion_move(fd,name,staged,before[0]); moved=True
+    except Exception:
+     # Retain the same pinned parent through rollback. Collision/lost fencing
+     # leaves the receipt and payload for reconciliation, never overwrites.
+     if moved:
+      try:
+       with self.db.transaction():
+        self.db.assert_reconciliation_lease(token)
+        self._deletion_move(fd,staged,name,before[0])
+      except Exception: pass
+     raise
+    if moved:
+     with self.db.transaction():
+      self.db.assert_reconciliation_lease(token)
+      if not self._deletion_live(r['uri']):
+       self._deletion_unlink(fd,staged,before[0])
+    count+=1
+   finally: os.close(fd)
   return count
  def reconcile_deletions(self,_lease_token=None):
   """Resolve rename/commit/unlink crash windows with DB status as authority."""
   owned=_lease_token is None
   token=_lease_token or self.db.acquire_reconciliation_lease()
   try:
+   from .scratch import reconcile
+   reconcile(self,token)
    return self._reconcile_deletions(token)
   finally:
    if owned:self.db.release_reconciliation_lease(token)
  def _reconcile_deletions(self,token):
-  """Implementation fenced by the SQLite lease before every filesystem write."""
+  """Pinned traversal; receipts bind new staging, hashes gate legacy recovery."""
   for project in self.db.all("select id,artifact_root from projects where artifact_root is not null"):
-   root=Path(project['artifact_root']).resolve()
-   if not root.is_dir(): continue
-   groups={}
-   # Walk recursively without following directory symlinks, then handle all
-   # copies for one original together in stable pathname order.
-   for directory,dirs,files in os.walk(root,followlinks=False):
-    dirs[:]=[d for d in dirs if not (Path(directory)/d).is_symlink()]
-    for filename in files:
-     if '.deleting-' not in filename: continue
-     staged=Path(directory)/filename
-     if staged.is_symlink() or not staged.is_file(): continue
-     original=staged.with_name(filename.rsplit('.deleting-',1)[0])
-     try:
-      staged.resolve().relative_to(root)
-      original.resolve(strict=False).relative_to(root)
-     except (ValueError,OSError): continue
-     if original.is_symlink() or (original.exists() and not original.is_file()): continue
-     groups.setdefault(original,[]).append(staged)
-   for original,staged_files in sorted(groups.items(),key=lambda item:str(item[0])):
-    self.db.renew_reconciliation_lease(token)
-    rows=self.db.all('select status,sha256 from artifacts where project_id=? and uri=? order by id',(project['id'],str(original)))
-    if not rows: continue
-    staged_files=sorted(staged_files,key=lambda p:p.name)
-    live=[row for row in rows if row['status']!='DELETED']
-    if not live:
-     for staged in staged_files:
-      with self.db.transaction():
-       self.db.assert_reconciliation_lease(token); staged.unlink(missing_ok=True)
-     continue
-    live_hashes={row['sha256'] for row in live}
-    # Only a byte-for-byte tracked live payload may be restored or discarded.
-    # Unknown/mismatched files are deliberately left for operator inspection.
-    original_hash=None
-    if original.is_file() and not original.is_symlink():
-     try: original_hash=self._hash(original)[0]
-     except OSError: pass
-    candidates=[]
-    for staged in staged_files:
-     try: digest=self._hash(staged)[0]
-     except OSError: continue
-     if digest in live_hashes: candidates.append((staged,digest))
-    if original_hash not in live_hashes and not original.exists() and candidates:
-     chosen,original_hash=candidates[0]
-     with self.db.transaction():
-      self.db.assert_reconciliation_lease(token); chosen.replace(original)
-    if original_hash in live_hashes:
-     for staged,digest in candidates:
-      if digest==original_hash and staged.exists():
-       with self.db.transaction():
-        self.db.assert_reconciliation_lease(token); staged.unlink(missing_ok=True)
+   root=Path(project['artifact_root']).absolute()
+   try: rootfd=open_dir_beneath(root)
+   except OSError: continue
+   try:
+    receipts={}
+    for event in self.db.all("select data_json from events where project_id=? and type='DELETION_PREPARED' order by id",(project['id'],)):
+     receipt=json.loads(event['data_json']); receipts[receipt['staged']]=receipt
+    # Explicitly close the generator on exceptional exits as well as exhaustion.
+    with closing(walk_dirs_at(rootfd)) as directories:
+     for relative,fd in directories:
+      for staged in sorted(os.listdir(fd)):
+       if '.deleting-' not in staged: continue
+       name=staged.rsplit('.deleting-',1)[0]
+       if not name: continue
+       uri=str(root/relative/name)
+       self.db.renew_reconciliation_lease(token)
+       try:
+        with self.db.transaction():
+         self.db.assert_reconciliation_lease(token)
+         rows=self.db.all('select status,sha256 from artifacts where uri=? order by id',(uri,))
+         if not rows: continue
+         candidate=self._deletion_snapshot(fd,staged)
+         if not candidate: continue
+         identity,digest=candidate
+         receipt=receipts.get(staged)
+         if staged.startswith(name+'.deleting-f01-') and not receipt: continue
+         if receipt and (receipt['uri']!=uri or tuple(receipt['identity'])!=identity or receipt['sha256']!=digest): continue
+         # Legacy staging has no receipt: exact tracked bytes are mandatory,
+         # including all-DELETED rows. A suffix alone never authorizes deletion.
+         if digest not in {row['sha256'] for row in rows}: continue
+         live=[row for row in rows if row['status']!='DELETED']
+         audio=self.db.one('select sha256 from audio where uri=?',(uri,))
+         if not live and not audio:
+          self.db.assert_reconciliation_lease(token)
+          self._deletion_unlink(fd,staged,identity)
+          continue
+         live_hashes={row['sha256'] for row in live}
+         if audio: live_hashes.add(audio['sha256'])
+         if digest not in live_hashes: continue
+         original=self._deletion_snapshot(fd,name)
+         self.db.assert_reconciliation_lease(token)
+         if original is None:
+          self._deletion_move(fd,staged,name,identity)
+         elif original[1]==digest:
+          assert_identity_at(fd,name,original[0])
+          self._deletion_unlink(fd,staged,identity)
+       except OSError:
+        # Collision, symlink, changed identity or unknown bytes: retain for review.
+        continue
+   finally: os.close(rootfd)
  def scheduled_cleanup(self,role=Role.OWNER):
   """Scheduled recovery and retention pass; safe to invoke repeatedly."""
   token=self.db.acquire_reconciliation_lease()
@@ -601,6 +762,14 @@ class Pipeline:
   if not s: raise ValueError('scene not found')
   if decision not in ('APPROVED','REJECTED'): raise ValueError('decision')
   with self.db.transaction():
+   s=self.db.one('select * from scenes where id=?',(s['id'],))
+   project=self.db.one('select * from projects where id=?',(pid,))
+   artifacts=self.db.all('select * from artifacts where scene_id=?',(s['id'],))
+   if decision=='APPROVED':
+    if not scene_qa_current(project,s,artifacts): raise PermissionError('current subject-bound QA required')
+    subject=image_subject(s,artifacts); artifact=next(a for a in artifacts if a['id']==subject['artifact_id'])
+    if self._hash(self._owned_path(pid,artifact['uri']))[0]!=subject['sha256']: raise PermissionError('QA image checksum mismatch')
+   self.db.execute("update approvals set revoked_at=?,revoked_reason='scene decision replaced' where project_id=? and scene_id=? and gate='SCENE' and revoked_at is null",(now(),pid,s['id']))
    self._fence_evidence_mutation(pid,'scene approval changed',preserve_scene_approvals=True)
    self.db.execute("update scenes set approval_state=? where id=?",(decision,s['id'])); evidence=self._scene_evidence_hash(s['id']); version=self.db.one('select version from projects where id=?',(pid,))['version']; self.db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,?,?,?,?,?,?,?)",(pid,s['id'],"SCENE",decision,actor,now(),version,evidence))
  def cancel_project(self,pid,role=Role.OWNER):
@@ -632,15 +801,57 @@ class Pipeline:
   with self.db.transaction():
    self._invalidate(pid,f'project configuration changed: {key}',clear_plan=key=='language')
    self.db.execute(f'update projects set {key}=? where id=?',(value,pid))
+ def _final_subject(self,pid,aid,assembler=None):
+  from .media import AssemblyError,LocalFinalAssembler
+  from .evidence import digest
+  self._active(pid)
+  row=self.db.one("select a.*,f.manifest_json,f.project_version assembly_version,f.evidence_sha256 assembly_evidence from artifacts a join final_assemblies f on f.artifact_id=a.id where a.project_id=? and a.id=? and a.kind='FINAL_VIDEO' and a.status='ACTIVE'",(pid,aid))
+  if not row: raise PermissionError('current registered FINAL_VIDEO required')
+  manifest=json.loads(row['manifest_json']); payload={k:v for k,v in manifest.items() if k!='manifest_sha256'}
+  if digest(payload)!=manifest.get('manifest_sha256') or manifest.get('input_identity',{}).get('schema_version')!=2 or digest(manifest['input_identity'])!=row['assembly_evidence']: raise PermissionError('legacy or invalid final manifest')
+  version=self.db.one('select version from projects where id=?',(pid,))['version']
+  if version!=row['assembly_version'] or self._manifest_hash(pid)!=manifest['current_evidence_sha256']: raise PermissionError('stale final input evidence')
+  # Re-enter full input gates and byte checks without publishing another output.
+  check=self.assemble(pid,self._root_lookup(pid)/('.review-'+uuid.uuid4().hex+'.mp4'),dry_run=True,assembler=assembler)
+  if check['manifest']['input_evidence_sha256']!=row['assembly_evidence']: raise PermissionError('stale final input identity')
+  path=self._owned_path(pid,row['uri'])
+  if self._hash(path)[0]!=row['sha256']: raise AssemblyError('final output checksum mismatch')
+  (assembler or LocalFinalAssembler(self._root_lookup(pid))).validate_final(path,manifest['audio']['duration_ms']/1000)
+  if self._hash(path)[0]!=row['sha256']: raise AssemblyError('final output changed during QA')
+  fresh=self.assemble(pid,self._root_lookup(pid)/('.review-check-'+uuid.uuid4().hex+'.mp4'),dry_run=True,assembler=assembler)
+  if fresh['manifest']['input_evidence_sha256']!=row['assembly_evidence']: raise PermissionError('final inputs changed during QA')
+  return {'schema_version':2,'project_id':pid,'project_version':version,'artifact_id':aid,'sha256':row['sha256'],'manifest_sha256':manifest['manifest_sha256'],'input_evidence_sha256':row['assembly_evidence'],'current_evidence_sha256':manifest['current_evidence_sha256']}
+ def record_final_qa(self,pid,aid,qa,role=Role.REVIEWER,assembler=None):
+  self._role(role,'approve')
+  if not isinstance(qa,QAEvidence): raise ValueError('typed final QA required')
+  with self.db.transaction():
+   subject=self._final_subject(pid,aid,assembler)
+   receipt={'schema_version':2,'subject':subject,'checks':qa.checks,'score':qa.score,'evaluator':qa.evaluator}
+   self.db.execute("update approvals set revoked_at=?,revoked_reason='final QA changed' where project_id=? and gate='FINAL' and revoked_at is null",(now(),pid))
+   self._event(pid,'FINAL_QA_RECORDED',receipt)
+  return receipt
+ def review_final(self,pid,aid,decision,actor,role=Role.REVIEWER,assembler=None):
+  from .evidence import digest
+  self._role(role,'approve' if decision=='APPROVED' else 'reject')
+  if decision not in ('APPROVED','REJECTED') or not actor.strip(): raise ValueError('final decision and actor required')
+  with self.db.transaction():
+   subject=self._final_subject(pid,aid,assembler)
+   row=self.db.one("select id,data_json from events where project_id=? and type='FINAL_QA_RECORDED' order by id desc limit 1",(pid,))
+   qa=json.loads(row['data_json']) if row else {}
+   if qa.get('subject')!=subject or not QAEvidence(qa['checks'],qa['score'],qa['evaluator']).passed: raise PermissionError('current persisted passing final QA required')
+   evidence=digest({'subject':subject,'qa_event_id':row['id'],'qa':qa})
+   self.db.execute("update approvals set revoked_at=?,revoked_reason='final review superseded' where project_id=? and gate='FINAL' and revoked_at is null",(now(),pid))
+   approval=self.db.execute("insert into approvals(project_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,'FINAL',?,?,?,?,?)",(pid,decision,actor,now(),subject['project_version'],evidence)).lastrowid
+   self._event(pid,'FINAL_REVIEWED',{'approval_id':approval,'subject':subject,'qa_event_id':row['id'],'qa':qa,'evidence_sha256':evidence})
+  return approval
  def decide_gate(self,pid,gate,decision,actor,role=Role.REVIEWER):
   command='approve' if decision=='APPROVED' else 'reject'; self._role(role,command)
   if gate not in {'PILOT','BATCH','FINAL'} or decision not in {'APPROVED','REJECTED'}: raise ValueError('unsupported gate decision')
-  self.db.execute("insert into approvals(project_id,gate,decision,actor,created_at) values(?,?,?,?,?)",(pid,gate,decision,actor,now()))
+  raise PermissionError(f'{gate} requires its dedicated evidence-bound review workflow; generic gate decisions are unsupported')
  def replace_scene_artifact(self,sid,uri,role=Role.OPERATOR):
   self._role(role,'scene-replace'); s=self.scene(int(sid)); self._active(s['project_id']); new_copies=[]
   try:
    with self.db.transaction():
-    self._fence_evidence_mutation(s['project_id'],'scene artifact replaced',scene_id=s['id'])
     old=self.db.one("select * from artifacts where scene_id=? and kind='IMAGE' and status='ACTIVE' order by version desc",(s['id'],))
     if old:self.db.execute("update artifacts set status='SUPERSEDED' where id=?",(old['id'],))
     aid=self.add_artifact(s['project_id'],'IMAGE',uri,s['id'],old['id'] if old else None,role,_new_copies=new_copies)
@@ -792,8 +1003,8 @@ class Pipeline:
  def status_summary(self,pid,role=Role.OPERATOR):
   """Read-only compact polling view (at most 8 SELECTs, no per-scene output).
 
-  ``current`` means active approved evidence for the current project version,
-  cryptographically matching each required scene or the current manifest.
+  ``current`` means subject/dependency-bound active scene evidence, or an
+  exact current-global-version manifest for project-level gates.
   Text caps are exposed by ``STATUS_TEXT_LIMITS``; indicators are capped at 8.
   """
   self._role(role,'status')
@@ -807,28 +1018,29 @@ class Pipeline:
    for dimension,key in (('scene','state'),('approval','approval_state'),('qa','qa_state')):
     value=s[key]; dimensions[dimension][value]=dimensions[dimension].get(value,0)+1
   artifacts=[dict(r) for r in self.db.all('select id,scene_id,kind,sha256,version,parent_id,status from artifacts where project_id=? order by id',(pid,))]
-  approvals=[dict(r) for r in self.db.all('select gate,scene_id,decision,revoked_at,project_version,evidence_sha256 from approvals where project_id=?',(pid,))]
+  approvals=[dict(r) for r in self.db.all("select a.*, (select e.data_json from events e where e.project_id=a.project_id and e.type='FINAL_REVIEWED' and json_extract(e.data_json,'$.approval_id')=a.id order by e.id desc limit 1) final_receipt from approvals a where a.project_id=?",(pid,))]
   gate_rows={}
   for a in approvals:
    row=gate_rows.setdefault(a['gate'],{'approved':0,'rejected':0,'active_approved':0}); row[a['decision'].lower()]=row.get(a['decision'].lower(),0)+1
-   if a['decision']=='APPROVED' and a['revoked_at'] is None and a['project_version']==p['version']: row['active_approved']+=1
-  project_evidence={k:p[k] for k in ('language','style_json','references_json','bible_json','image_provider','whiteboard_mode','seed','transition','min_scenes','max_scenes','output_json','version')}
-  manifest_scenes=[{k:s[k] for k in ('id','code','ord','start_ms','end_ms','text','special','state','approval_state','qa_state','qa_json','duration_exception','continuity_json','checkpoint_json')} for s in scenes]
-  digest=lambda value: hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
-  manifest_hash=digest({'project':project_evidence,'scenes':manifest_scenes,'artifacts':artifacts})
+   if a['decision']=='APPROVED' and a['revoked_at'] is None and (a['gate']=='SCENE' or a['project_version']==p['version']): row['active_approved']+=1
+  manifest_hash=manifest_evidence_hash(p,scenes,artifacts)
   required_scenes=[s for s in scenes if s['ord']<=5 or s['special']==1]
   artifacts_by_scene={s['id']:[] for s in required_scenes}
   for a in artifacts:
    if a['scene_id'] in artifacts_by_scene and a['status']=='ACTIVE': artifacts_by_scene[a['scene_id']].append(a)
   pilot_current=bool(required_scenes)
   for s in required_scenes:
-   scene_fields={k:s[k] for k in ('id','project_id','code','ord','start_ms','end_ms','text','special','state','qa_state','qa_json','duration_exception','continuity_json','checkpoint_json')}
-   evidence=digest({'scene':scene_fields,'artifacts':artifacts_by_scene[s['id']]})
-   if s['approval_state']!='APPROVED' or not any(a['gate']=='SCENE' and a['scene_id']==s['id'] and a['decision']=='APPROVED' and a['revoked_at'] is None and a['project_version']==p['version'] and a['evidence_sha256']==evidence for a in approvals): pilot_current=False
+   if not scene_approval_current(p,s,artifacts_by_scene[s['id']],approvals): pilot_current=False
   def gate(key,current):
-   row=gate_rows.get(key,{}); return {'approved':row.get('approved',0),'rejected':row.get('rejected',0),'active':row.get('active_approved',0)>0,'current':bool(current),'evidence':'CURRENT_VERSION_ACTIVE'}
+   row=gate_rows.get(key,{}); return {'approved':row.get('approved',0),'rejected':row.get('rejected',0),'active':row.get('active_approved',0)>0,'current':bool(current),'evidence':'SCENE_DEPENDENCY_CURRENT' if key=='SCENE' else 'CURRENT_VERSION_ACTIVE'}
   manifest_current=lambda key:any(a['gate']==key and a['scene_id'] is None and a['decision']=='APPROVED' and a['revoked_at'] is None and a['project_version']==p['version'] and a['evidence_sha256']==manifest_hash for a in approvals)
-  gates={'pilot':gate('SCENE',pilot_current),'post_batch':gate('POST_BATCH',manifest_current('POST_BATCH')),'final':gate('FINAL',manifest_current('FINAL'))}
+  from .evidence import digest
+  def final_current(a):
+   try:
+    r=json.loads(a['final_receipt']); subject=r['subject']
+    return bool(a['gate']=='FINAL' and a['decision']=='APPROVED' and a['revoked_at'] is None and a['project_version']==p['version'] and subject['project_id']==pid and subject['project_version']==p['version'] and subject['current_evidence_sha256']==manifest_hash and r['qa']['subject']==subject and QAEvidence(r['qa']['checks'],r['qa']['score'],r['qa']['evaluator']).passed and digest({'subject':subject,'qa_event_id':r['qa_event_id'],'qa':r['qa']})==a['evidence_sha256'] and any(x['id']==subject['artifact_id'] and x['sha256']==subject['sha256'] and x['kind']=='FINAL_VIDEO' and x['status']=='ACTIVE' for x in artifacts))
+   except (KeyError,TypeError,ValueError): return False
+  gates={'pilot':gate('SCENE',pilot_current),'post_batch':gate('POST_BATCH',manifest_current('POST_BATCH')),'final':gate('FINAL',any(final_current(a) for a in approvals))}
   job_groups=self.db.all("select kind,state,count(*) count from jobs where project_id=? and project_version=? group by kind,state order by count(*) desc,kind,state limit ?",(pid,p['version'],self.STATUS_JOB_GROUP_LIMIT+1))
   jobs=[{'kind':cut(r['kind'],self.STATUS_TEXT_LIMITS['job_kind']),'state':cut(r['state'],self.STATUS_TEXT_LIMITS['job_state']),'count':r['count']} for r in job_groups[:self.STATUS_JOB_GROUP_LIMIT]]
   if len(job_groups)>self.STATUS_JOB_GROUP_LIMIT:

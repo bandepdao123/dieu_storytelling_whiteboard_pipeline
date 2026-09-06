@@ -1,4 +1,5 @@
 import pytest
+from qa_helpers import ready_qa
 
 from du_pipeline.adapters import Role
 from du_pipeline.contracts import QAEvidence
@@ -52,9 +53,11 @@ def test_complete_fake_vertical_slice_persists_gate_and_delivery_artifacts(tmp_p
     p.execute_images(ids[:5], {})
     passed = QAEvidence({"composition": True, "style": True}, .99, "fake-ai")
     for s in scenes[:5]:
+        ready_qa(p,s)
         p.record_scene_qa(s["id"], passed); p.decide_scene(pid, s["code"], "APPROVED", "reviewer")
     assert p.start_batch(pid)
     p.execute_images(ids[5:], {})
+    ready_qa(p,scenes[5])
     p.record_scene_qa(ids[5], passed)
     sheet = tmp_path / "contact.png"; sheet.write_bytes(b"contact-sheet")
     contact = p.approve_post_batch(pid, passed, str(sheet), "reviewer")

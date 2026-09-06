@@ -1,4 +1,5 @@
 import hashlib, json, threading
+from qa_helpers import ready_qa
 from pathlib import Path
 import pytest
 
@@ -42,12 +43,15 @@ def test_sheet_direct_dry_run_no_client_and_no_db_writes(tmp_path):
 
 def test_sheet_malformed_then_valid_cross_project_and_outcomes(tmp_path):
     db,p1=setup(tmp_path,"a"); p2=Pipeline(db).init_project("b",scene_range=(1,2)); db.execute("insert into scenes(project_id,code,ord,start_ms,end_ms,text,state,approval_state,qa_state) values(?,?,?,?,?,?,?,?,?)",(p2,'S001',1,0,1000,'x','PLANNED','REQUIRED','PENDING'))
+    p=Pipeline(db)
+    for pid in (p1,p2): ready_qa(p,p.status(pid)['scenes'][0])
     rows=[{"command_id":"bad","command":"BOGUS"},{"command_id":"same","command":"APPROVE","scene_code":"S001"}]
     assert SheetsAdapter(Sheet(rows),db).ingest_commands(p1)["outcomes"] == ["QUARANTINED","COMPLETED"]
     assert SheetsAdapter(Sheet(rows[1:]),db).ingest_commands(p2)["outcomes"] == ["COMPLETED"]
 
 def test_sheet_concurrent_claim_single_execution(tmp_path):
     db,pid=setup(tmp_path); path=db.path; rows=[{"command_id":"x","command":"APPROVE","scene_code":"S001"}]
+    p=Pipeline(db); ready_qa(p,p.status(pid)['scenes'][0])
     barrier=threading.Barrier(2); results=[]
     def run():
         d=Database(path); barrier.wait(); results.append(SheetsAdapter(Sheet(rows),d).ingest_commands(pid)); d.conn.close()

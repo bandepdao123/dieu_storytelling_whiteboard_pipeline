@@ -1,4 +1,5 @@
 import sqlite3,pytest
+from qa_helpers import ready_qa
 from du_pipeline.db import Database
 from du_pipeline.service import Pipeline
 from du_pipeline.adapters import Role
@@ -13,7 +14,7 @@ def test_gates_retry_checkpoints_and_rerun(tmp_path):
  d,p,pid,scenes=project(tmp_path)
  with pytest.raises(PermissionError): p.start_batch(pid)
  for s in scenes:
-  p.record_image_attempt(s['id'],True); p.record_scene_qa(s['id'],QAEvidence({'composition':True},1,'fake')); p.decide_scene(pid,s['code'],'APPROVED','r')
+  ready_qa(p,s); p.decide_scene(pid,s['code'],'APPROVED','r')
  assert p.start_batch(pid)
  with pytest.raises(PermissionError):p.start_animation(pid)
  with pytest.raises(ValueError):p.approve_post_batch(pid,False,'sheet','r')

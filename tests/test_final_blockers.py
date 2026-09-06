@@ -90,7 +90,9 @@ def test_reconcile_multiple_staged_files_validates_content(tmp_path):
         original.replace(good_a); good_b.write_bytes(b"tracked")
         pipeline.reconcile_deletions()
         assert not original.exists()
-        assert not good_a.exists() and not good_b.exists() and not bad.exists()
+        assert not good_a.exists() and not good_b.exists()
+        # DELETED is not ownership of arbitrary bytes with a matching suffix.
+        assert bad.read_bytes() == b"other"
         pipeline.reconcile_deletions()
 
 

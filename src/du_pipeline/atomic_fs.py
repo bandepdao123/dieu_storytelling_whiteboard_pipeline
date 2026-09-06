@@ -51,7 +51,19 @@ def open_dir_beneath(root, relative=Path('.'), create=False):
     relative = Path(relative)
     if relative.is_absolute() or '..' in relative.parts: raise PermissionError('path escapes managed artifact root')
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-    fd = os.open(root, flags)
+    # Pin every absolute component as well: O_NOFOLLOW on root alone does not
+    # protect an ancestor of root from being replaced by a symlink.
+    root = Path(root).absolute()
+    if '..' in root.parts: raise PermissionError('invalid managed root')
+    fd = os.open(root.anchor, flags)
+    try:
+        for part in root.parts[1:]:
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+    except BaseException:
+        os.close(fd)
+        raise
     try:
         for part in relative.parts:
             if part in ('', '.'): continue
@@ -60,5 +72,55 @@ def open_dir_beneath(root, relative=Path('.'), create=False):
                 except FileExistsError: pass
             child = os.open(part, flags, dir_fd=fd); os.close(fd); fd = child
         return fd
-    except Exception:
+    except BaseException:
         os.close(fd); raise
+
+
+def file_identity(st):
+    """Stable inode ownership plus content-change detection (rename changes ctime)."""
+    return (st.st_dev, st.st_ino, st.st_uid, st.st_gid, st.st_mode,
+            st.st_size, st.st_mtime_ns)
+
+
+def snapshot_at(fd, name):
+    """Read only a regular no-follow leaf; reject replacement during hashing."""
+    import hashlib
+    import stat
+    if not name or Path(name).name != name or name in ('.', '..'):
+        raise PermissionError('a single leaf name is required')
+    leaf = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    try:
+        before = os.fstat(leaf)
+        if not stat.S_ISREG(before.st_mode):
+            raise PermissionError('not a regular owned file')
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(leaf, 1024 * 1024)
+            if not chunk: break
+            digest.update(chunk)
+        identity = file_identity(before)
+        if identity != file_identity(os.fstat(leaf)) or before.st_ctime_ns != os.fstat(leaf).st_ctime_ns:
+            raise PermissionError('file changed while hashing')
+        assert_identity_at(fd, name, identity)
+        return identity, digest.hexdigest()
+    finally:
+        os.close(leaf)
+
+
+def assert_identity_at(fd, name, identity):
+    if file_identity(os.stat(name, dir_fd=fd, follow_symlinks=False)) != tuple(identity):
+        raise PermissionError('file identity changed')
+
+
+def walk_dirs_at(fd, relative=Path('.')):
+    """Yield borrowed pinned directory FDs; no pathname-based walk/reopen."""
+    yield relative, fd
+    for name in sorted(os.listdir(fd)):
+        try:
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=fd)
+        except OSError:
+            continue
+        try:
+            yield from walk_dirs_at(child, relative / name)
+        finally:
+            os.close(child)

@@ -1,4 +1,5 @@
 import json
+from qa_helpers import ready_qa
 import pytest
 from du_pipeline.adapters import Role
 from du_pipeline.db import Database
@@ -99,14 +100,18 @@ def test_summary_current_failed_and_blocked_indicator_codes(tmp_path):
 def test_summary_gates_require_exact_current_evidence(tmp_path):
     db,pipeline,pid=_planned(tmp_path,2); stamp="2026-01-02T03:04:05+00:00"
     scenes=db.all("select * from scenes where project_id=? order by ord",(pid,))
-    db.execute("update scenes set approval_state='APPROVED' where project_id=?",(pid,))
     for scene in scenes:
-        evidence=pipeline._scene_evidence_hash(scene["id"])
-        db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,?,?,?,?,?,?,?)",(pid,scene["id"],"SCENE","APPROVED","reviewer",stamp,1,evidence))
+        ready_qa(pipeline,scene)
+        pipeline.decide_scene(pid,scene['code'],'APPROVED','reviewer')
+    version=pipeline.status(pid)['project']['version']
     manifest=pipeline._manifest_hash(pid)
     for gate in ("POST_BATCH","FINAL"):
-        db.execute("insert into approvals(project_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,?,?,?,?,?,?)",(pid,gate,"APPROVED","reviewer",stamp,1,manifest))
-    assert all(g["current"] for g in pipeline.status_summary(pid)["gates"].values())
+        db.execute("insert into approvals(project_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,?,?,?,?,?,?)",(pid,gate,"APPROVED","reviewer",stamp,version,manifest))
+    gates=pipeline.status_summary(pid)['gates']
+    assert gates['pilot']['current'] and gates['post_batch']['current']
+    # A legacy SQL FINAL row without an output/QA receipt must not open FINAL.
+    # Positive FINAL acceptance is exercised via public real-media APIs.
+    assert gates['final']['current'] is False
 
     db.execute("update approvals set evidence_sha256=? where scene_id=?",("0"*64,scenes[0]["id"]))
     db.execute("update approvals set evidence_sha256=? where gate='POST_BATCH'",("1"*64,))

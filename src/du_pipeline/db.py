@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime,timezone,timedelta
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 class SchemaVersionError(RuntimeError): pass
 class LeaseUnavailable(RuntimeError): pass
@@ -51,7 +51,7 @@ class Database:
      if statement.strip(): self.conn.execute(statement)
     self.conn.execute('PRAGMA user_version=1'); version=1
    # Explicit 1 -> 2 additive upgrade from the original schema; 2 is verified below.
-   if version not in (1,2,3,4,5,6,7,8,9,10,11): raise SchemaVersionError(f'unsupported schema version {version}')
+   if version not in (1,2,3,4,5,6,7,8,9,10,11,12): raise SchemaVersionError(f'unsupported schema version {version}')
    cols={r[1] for r in self.conn.execute('pragma table_info(projects)')}
    if version == 2 and 'artifact_root' not in cols: raise SchemaVersionError('schema version 2 does not match structure')
    additions=[('min_scenes','INTEGER NOT NULL DEFAULT 50'),('max_scenes','INTEGER NOT NULL DEFAULT 360'),('retention_days','INTEGER NOT NULL DEFAULT 3'),('output_json',"TEXT NOT NULL DEFAULT '{}'") ,('version','INTEGER NOT NULL DEFAULT 1'),('artifact_root','TEXT')]
@@ -119,7 +119,16 @@ class Database:
    self.conn.execute('CREATE INDEX IF NOT EXISTS idx_jobs_project_state_id ON jobs(project_id,state,id)')
    self.conn.execute('CREATE INDEX IF NOT EXISTS idx_events_project_type_id ON events(project_id,type,id)')
    self.conn.execute('CREATE INDEX IF NOT EXISTS idx_artifacts_cleanup ON artifacts(status,expires_at,project_id)')
-   self.conn.execute('CREATE INDEX IF NOT EXISTS idx_attempts_scene_number ON attempts(scene_id,number)')
+   # v12 preserves attempts when a plan replaces scene rows. Epoch zero is
+   # exactly the historical 1..3 budget; approved reruns allocate later epochs.
+   attempt_cols={r[1] for r in self.conn.execute('pragma table_info(attempts)')}
+   if 'epoch' not in attempt_cols:
+    self.conn.execute('ALTER TABLE attempts RENAME TO attempts_legacy_v11')
+    self.conn.execute("CREATE TABLE attempts(id INTEGER PRIMARY KEY,scene_id INTEGER REFERENCES scenes(id) ON DELETE SET NULL,number INTEGER NOT NULL CHECK(number BETWEEN 1 AND 3),provider TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('RUNNING','SUCCEEDED','FAILED')),error TEXT,failed_path TEXT,failed_sha256 TEXT,failed_size INTEGER,created_at TEXT NOT NULL,project_id TEXT REFERENCES projects(id),scene_code TEXT,epoch INTEGER NOT NULL DEFAULT 0 CHECK(epoch>=0),UNIQUE(scene_id,epoch,number))")
+    self.conn.execute('INSERT INTO attempts(id,scene_id,number,provider,state,error,failed_path,failed_sha256,failed_size,created_at,project_id,scene_code,epoch) SELECT a.id,a.scene_id,a.number,a.provider,a.state,a.error,a.failed_path,a.failed_sha256,a.failed_size,a.created_at,s.project_id,s.code,0 FROM attempts_legacy_v11 a JOIN scenes s ON s.id=a.scene_id')
+    if self.conn.execute('SELECT count(*) FROM attempts').fetchone()[0]!=self.conn.execute('SELECT count(*) FROM attempts_legacy_v11').fetchone()[0]: raise SchemaVersionError('attempt owner missing during migration')
+    self.conn.execute('DROP TABLE attempts_legacy_v11')
+   self.conn.execute('CREATE INDEX IF NOT EXISTS idx_attempts_scene_number ON attempts(scene_id,epoch,number)')
    self.conn.execute('CREATE TABLE IF NOT EXISTS remote_uploads(project_id TEXT,local_path TEXT,remote_id TEXT,state TEXT,size INTEGER,sha256 TEXT,error TEXT,updated_at TEXT,PRIMARY KEY(project_id,local_path))')
    # Composite ownership safeguards without rebuilding legacy tables.
    ownership=(

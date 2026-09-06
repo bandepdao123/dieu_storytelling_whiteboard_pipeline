@@ -6,6 +6,8 @@ import du_pipeline.service as service_module
 from du_pipeline.db import Database
 from du_pipeline.service import Pipeline, now
 from du_pipeline.media import AssemblyError, LocalFinalAssembler
+from du_pipeline.contracts import QAEvidence
+from qa_helpers import ready_qa
 
 
 def sha(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
@@ -13,11 +15,12 @@ def sha(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 def fixture(tmp_path):
     db=Database(tmp_path/'p.db'); p=Pipeline(db); pid=p.init_project('x',scene_range=(1,3)); root=p._root(pid)
     audio=root/'narration.wav'; audio.write_bytes(b'audio'); p.import_audio(pid,str(audio),2000,sha(audio))
-    db.execute("insert into scenes(project_id,code,ord,start_ms,end_ms,text,special,state,approval_state,qa_state,qa_json) values(?,?,?,?,?,?,?,?,?,?,?)",(pid,'S001',1,0,2000,'x',0,'ANIMATED','APPROVED','PASS','{}'))
-    sid=db.one('select id from scenes')['id']; clip=root/'clip.mp4'; clip.write_bytes(b'clip'); aid=p.add_artifact(pid,'SCENE_VIDEO',clip,sid)
-    evidence=p._scene_evidence_hash(sid); version=db.one('select version from projects')['version']
-    db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,?,?,?,?,?,?,?)",(pid,sid,'SCENE','APPROVED','t',now(),version,evidence))
-    db.execute("insert into approvals(project_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,?,?,?,?,?,?)",(pid,'POST_BATCH','APPROVED','batch-reviewer',now(),version,p._manifest_hash(pid)))
+    p.import_srt(pid,[(0,2000,'x')]); scene=p.plan_scenes(pid)[0]; sid=scene['id']
+    ready_qa(p,scene)
+    clip=root/'clip.mp4'; clip.write_bytes(b'clip'); aid=p.add_artifact(pid,'SCENE_VIDEO',clip,sid)
+    p.decide_scene(pid,'S001','APPROVED','t')
+    sheet=root/'sheet.ppm'; sheet.write_bytes(b'P6\n1 1\n255\n\x80\x40\x20')
+    p.approve_post_batch(pid,QAEvidence({'all':True},1,'fixture'),sheet,'batch-reviewer')
     return db,p,pid,root,sid,aid,audio
 
 def test_command_has_audio_and_no_shortest(tmp_path):
@@ -34,7 +37,7 @@ def test_dry_run_order_and_no_artifact(tmp_path):
 def test_missing_duplicate_and_tamper_fail_closed(tmp_path):
     db,p,pid,root,sid,aid,audio=fixture(tmp_path)
     db.execute("update scenes set approval_state='NOT_REQUIRED' where id=?",(sid,))
-    db.execute("update artifacts set status='SUPERSEDED' where id=?",(aid,))
+    db.execute("update artifacts set status='SUPERSEDED' where scene_id=?",(sid,))
     with pytest.raises(AssemblyError,match='exactly one'): p.assemble(pid,root/'f.mp4',dry_run=True)
     db.execute("update artifacts set status='ACTIVE' where id=?",(aid,)); other=root/'other.mp4'; other.write_bytes(b'x'); p.add_artifact(pid,'ANIMATION',other,sid)
     with pytest.raises(AssemblyError,match='duplicate'): p.assemble(pid,root/'f.mp4',dry_run=True)
@@ -70,12 +73,16 @@ def test_real_ordered_scenes_and_narration_produce_conformant_mp4(tmp_path):
     audio=root/'narration.wav'; subprocess.run(['ffmpeg','-y','-f','lavfi','-i','sine=frequency=440:duration=2',str(audio)],check=True,capture_output=True); p.import_audio(pid,str(audio),2000,sha(audio))
     image=root/'second.png'; subprocess.run(['ffmpeg','-y','-f','lavfi','-i','color=c=blue:s=64x64','-frames:v','1',str(image)],check=True,capture_output=True)
     clip=root/'first.mp4'; subprocess.run(['ffmpeg','-y','-f','lavfi','-i','color=c=red:s=64x64:d=1','-c:v','libx264','-pix_fmt','yuv420p',str(clip)],check=True,capture_output=True)
-    version=db.one('select version from projects where id=?',(pid,))['version']; source_ids=[]
+    p.import_srt(pid,[(0,1000,'S001'),(1000,2000,'S002')]); scenes=p.plan_scenes(pid); source_ids=[]
     for code,order,start,end,path,kind in [('S001',1,0,1000,clip,'SCENE_VIDEO'),('S002',2,1000,2000,image,'IMAGE')]:
-        db.execute("insert into scenes(project_id,code,ord,start_ms,end_ms,text,special,state,approval_state,qa_state,qa_json) values(?,?,?,?,?,?,?,?,?,?,?)",(pid,code,order,start,end,code,0,'ANIMATED','APPROVED','PASS','{}'))
-        sid=db.one('select id from scenes where project_id=? and code=?',(pid,code))['id']; aid=p.add_artifact(pid,kind,path,sid); source_ids.append(aid)
-        db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,?,?,?,?,?,?,?)",(pid,sid,'SCENE','APPROVED','test',now(),version,p._scene_evidence_hash(sid)))
-    db.execute("insert into approvals(project_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,?,?,?,?,?,?)",(pid,'POST_BATCH','APPROVED','batch-reviewer',now(),version,p._manifest_hash(pid)))
+        scene=scenes[order-1]; sid=scene['id']
+        if kind=='SCENE_VIDEO': ready_qa(p,scene)
+        aid=p.add_artifact(pid,kind,path,sid); source_ids.append(aid)
+        if kind=='IMAGE':
+            p.record_image_attempt(sid,True)
+            p.record_scene_qa(sid,QAEvidence({'visual':True},1,'test'))
+        p.decide_scene(pid,code,'APPROVED','test')
+    p.approve_post_batch(pid,QAEvidence({'all':True},1,'test'),image,'batch-reviewer')
     output=root/'ordered-final.mp4'; result=p.assemble(pid,output)
     probe=json.loads(subprocess.run(['ffprobe','-v','error','-show_streams','-show_format','-of','json',str(output)],check=True,capture_output=True,text=True).stdout)
     video=next(s for s in probe['streams'] if s['codec_type']=='video'); audio_stream=next(s for s in probe['streams'] if s['codec_type']=='audio')
