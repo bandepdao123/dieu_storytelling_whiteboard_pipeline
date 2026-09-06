@@ -18,3 +18,12 @@ def test_cli_end_to_end(tmp_path, capsys):
     pid = json.loads(capsys.readouterr().out)["project_id"]
     assert main(["--db", db, "status", pid]) == 0
     assert json.loads(capsys.readouterr().out)["project"]["name"] == "Demo"
+
+
+def test_report_cli_forwards_role(tmp_path, monkeypatch, capsys):
+    seen = {}
+    def report(self, pid, role):
+        seen.update(pid=pid, role=role); return {"ok": True}
+    monkeypatch.setattr("du_pipeline.cli.Pipeline.report", report)
+    assert main(["--db", str(tmp_path/"p.db"), "--role", "REVIEWER", "report", "p1"]) == 0
+    assert seen == {"pid": "p1", "role": "REVIEWER"}

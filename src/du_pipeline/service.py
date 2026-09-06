@@ -11,6 +11,12 @@ from .atomic_fs import rename_noreplace,rename_noreplace_at,open_dir_beneath
 
 def now(): return datetime.now(timezone.utc).isoformat()
 class Pipeline:
+ # status_summary is a polling contract: every returned string is either an
+ # enumerated/database identifier or truncated to these documented character caps.
+ STATUS_TEXT_LIMITS={'project_name':128,'blocked_reason':256,'job_kind':48,'job_state':24}
+ STATUS_SUMMARY_QUERY_CEILING=8
+ STATUS_JOB_GROUP_LIMIT=8
+ STATUS_INDICATOR_LIMIT=8
  def __init__(self,db,duration_policy=None,scheduler=None): self.db=db; self.duration_policy=duration_policy or DurationPolicy(); self.scheduler=scheduler or ResourceScheduler()
  def _role(self,role,command):
   try:r=role if isinstance(role,Role) else Role(role)
@@ -783,6 +789,54 @@ class Pipeline:
    self.db.execute("update jobs set state='QUEUED',updated_at=? where project_id=? and state='PAUSED' and project_version=?",(now(),pid,p['version']))
    self._event(pid,"RESUMED")
  def status(self,pid,role=Role.OPERATOR): self._role(role,'status'); return {"project":dict(self.db.one("select * from projects where id=?",(pid,))),"scenes":[dict(x) for x in self.db.all("select * from scenes where project_id=? order by ord",(pid,))],"jobs":[dict(x) for x in self.db.all('select * from jobs where project_id=?',(pid,))]}
+ def status_summary(self,pid,role=Role.OPERATOR):
+  """Read-only compact polling view (at most 8 SELECTs, no per-scene output).
+
+  ``current`` means active approved evidence for the current project version,
+  cryptographically matching each required scene or the current manifest.
+  Text caps are exposed by ``STATUS_TEXT_LIMITS``; indicators are capped at 8.
+  """
+  self._role(role,'status')
+  p=self.db.one('select * from projects where id=?',(pid,))
+  if not p: raise ValueError('project not found')
+  cut=lambda value,limit: None if value is None else str(value)[:limit]
+  project={'id':p['id'],'name':cut(p['name'],self.STATUS_TEXT_LIMITS['project_name']),'language':p['language'],'state':p['state'],'blocked':p['state']=='BLOCKED','blocked_reason':cut(p['blocked_reason'],self.STATUS_TEXT_LIMITS['blocked_reason']),'version':p['version']}
+  scenes=[dict(r) for r in self.db.all('select * from scenes where project_id=? order by ord',(pid,))]
+  dimensions={'scene':{'total':len(scenes)},'approval':{},'qa':{}}
+  for s in scenes:
+   for dimension,key in (('scene','state'),('approval','approval_state'),('qa','qa_state')):
+    value=s[key]; dimensions[dimension][value]=dimensions[dimension].get(value,0)+1
+  artifacts=[dict(r) for r in self.db.all('select id,scene_id,kind,sha256,version,parent_id,status from artifacts where project_id=? order by id',(pid,))]
+  approvals=[dict(r) for r in self.db.all('select gate,scene_id,decision,revoked_at,project_version,evidence_sha256 from approvals where project_id=?',(pid,))]
+  gate_rows={}
+  for a in approvals:
+   row=gate_rows.setdefault(a['gate'],{'approved':0,'rejected':0,'active_approved':0}); row[a['decision'].lower()]=row.get(a['decision'].lower(),0)+1
+   if a['decision']=='APPROVED' and a['revoked_at'] is None and a['project_version']==p['version']: row['active_approved']+=1
+  project_evidence={k:p[k] for k in ('language','style_json','references_json','bible_json','image_provider','whiteboard_mode','seed','transition','min_scenes','max_scenes','output_json','version')}
+  manifest_scenes=[{k:s[k] for k in ('id','code','ord','start_ms','end_ms','text','special','state','approval_state','qa_state','qa_json','duration_exception','continuity_json','checkpoint_json')} for s in scenes]
+  digest=lambda value: hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+  manifest_hash=digest({'project':project_evidence,'scenes':manifest_scenes,'artifacts':artifacts})
+  required_scenes=[s for s in scenes if s['ord']<=5 or s['special']==1]
+  artifacts_by_scene={s['id']:[] for s in required_scenes}
+  for a in artifacts:
+   if a['scene_id'] in artifacts_by_scene and a['status']=='ACTIVE': artifacts_by_scene[a['scene_id']].append(a)
+  pilot_current=bool(required_scenes)
+  for s in required_scenes:
+   scene_fields={k:s[k] for k in ('id','project_id','code','ord','start_ms','end_ms','text','special','state','qa_state','qa_json','duration_exception','continuity_json','checkpoint_json')}
+   evidence=digest({'scene':scene_fields,'artifacts':artifacts_by_scene[s['id']]})
+   if s['approval_state']!='APPROVED' or not any(a['gate']=='SCENE' and a['scene_id']==s['id'] and a['decision']=='APPROVED' and a['revoked_at'] is None and a['project_version']==p['version'] and a['evidence_sha256']==evidence for a in approvals): pilot_current=False
+  def gate(key,current):
+   row=gate_rows.get(key,{}); return {'approved':row.get('approved',0),'rejected':row.get('rejected',0),'active':row.get('active_approved',0)>0,'current':bool(current),'evidence':'CURRENT_VERSION_ACTIVE'}
+  manifest_current=lambda key:any(a['gate']==key and a['scene_id'] is None and a['decision']=='APPROVED' and a['revoked_at'] is None and a['project_version']==p['version'] and a['evidence_sha256']==manifest_hash for a in approvals)
+  gates={'pilot':gate('SCENE',pilot_current),'post_batch':gate('POST_BATCH',manifest_current('POST_BATCH')),'final':gate('FINAL',manifest_current('FINAL'))}
+  job_groups=self.db.all("select kind,state,count(*) count from jobs where project_id=? and project_version=? group by kind,state order by count(*) desc,kind,state limit ?",(pid,p['version'],self.STATUS_JOB_GROUP_LIMIT+1))
+  jobs=[{'kind':cut(r['kind'],self.STATUS_TEXT_LIMITS['job_kind']),'state':cut(r['state'],self.STATUS_TEXT_LIMITS['job_state']),'count':r['count']} for r in job_groups[:self.STATUS_JOB_GROUP_LIMIT]]
+  if len(job_groups)>self.STATUS_JOB_GROUP_LIMIT:
+   other=self.db.one("select count(*) count,count(distinct kind||char(0)||state) groups from jobs where project_id=? and project_version=? and (kind,state) not in (select kind,state from jobs where project_id=? and project_version=? group by kind,state order by count(*) desc,kind,state limit ?)",(pid,p['version'],pid,p['version'],self.STATUS_JOB_GROUP_LIMIT))
+   jobs.append({'kind':'OTHER','state':'OTHER','count':other['count'],'unknown_group_count':other['groups']})
+  stale=self.db.one('select count(*) n from jobs where project_id=? and (project_version is null or project_version!=?)',(pid,p['version']))['n']
+  indicators=[dict(r) for r in self.db.all("select code,timestamp from (select 'IMAGE_ATTEMPT_FAILED' code,a.created_at timestamp from attempts a join scenes s on s.id=a.scene_id where s.project_id=? and a.state='FAILED' union all select case when state='FAILED' then 'JOB_FAILED' else 'JOB_BLOCKED' end,updated_at from jobs where project_id=? and project_version=? and state in ('FAILED','BLOCKED')) order by timestamp desc limit ?",(pid,pid,p['version'],self.STATUS_INDICATOR_LIMIT))]
+  return {'project':project,'scene_counts':dimensions['scene'],'approval_counts':dimensions['approval'],'qa_counts':dimensions['qa'],'gates':gates,'current_jobs':jobs,'stale_job_count':stale,'indicators':indicators}
  def report(self,pid,role=Role.OPERATOR):
   self._role(role,'cost-report')
   return {"costs":[dict(x) for x in self.db.all("select * from cost_observations where project_id=?",(pid,))],"errors":[dict(x) for x in self.db.all("select * from events where project_id=? and (type like '%BLOCKED' or data_json like '%error%')",(pid,))]}

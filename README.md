@@ -25,6 +25,8 @@ du-pipeline --db demo.db import-audio PROJECT_ID narration.wav 60000 aaaaaaaaaaa
 du-pipeline --db demo.db import-srt PROJECT_ID narration.srt
 du-pipeline --db demo.db plan PROJECT_ID
 du-pipeline --db demo.db status PROJECT_ID
+# polling/dashboard: payload gọn, không chứa toàn bộ scene
+du-pipeline --db demo.db status-summary PROJECT_ID
 du-pipeline --db demo.db pause PROJECT_ID
 du-pipeline --db demo.db resume PROJECT_ID
 du-pipeline --db demo.db retry SCENE_DATABASE_ID
