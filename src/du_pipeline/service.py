@@ -52,10 +52,17 @@ class Pipeline:
   with self.db.transaction():
    if old:self._invalidate(pid,'audio changed')
    self.db.execute("insert or replace into audio values(?,?,?,?)",(pid,uri,duration_ms,sha256)); self._event(pid,"AUDIO_IMPORTED")
- def _fence_evidence_mutation(self,pid,reason):
+ def _fence_evidence_mutation(self,pid,reason,scene_id=None,preserve_scene_approvals=False):
   """Fence work authorized by pre-mutation evidence; caller owns the transaction."""
   self.db.execute("update jobs set state='BLOCKED',updated_at=?,lease_owner=NULL,lease_expires_at=NULL where project_id=? and state in ('QUEUED','RUNNING','PAUSED')",(now(),pid))
-  self.db.execute("update approvals set revoked_at=?,revoked_reason=? where project_id=? and revoked_at is null",(now(),reason,pid))
+  if preserve_scene_approvals:
+   self.db.execute("update approvals set revoked_at=?,revoked_reason=? where project_id=? and gate!='SCENE' and revoked_at is null",(now(),reason,pid))
+  elif scene_id is not None:
+   self.db.execute("update approvals set revoked_at=?,revoked_reason=? where project_id=? and (gate!='SCENE' or scene_id=?) and revoked_at is null",(now(),reason,pid,scene_id))
+   self.db.execute("update scenes set approval_state=case when special=1 or ord<=5 then 'REQUIRED' else 'NOT_REQUIRED' end where id=?",(scene_id,))
+  else:
+   self.db.execute("update approvals set revoked_at=?,revoked_reason=? where project_id=? and revoked_at is null",(now(),reason,pid))
+   self.db.execute("update scenes set approval_state=case when special=1 or ord<=5 then 'REQUIRED' else 'NOT_REQUIRED' end where project_id=?",(pid,))
   self.db.execute('update projects set version=version+1 where id=?',(pid,))
   self._event(pid,'DOWNSTREAM_INVALIDATED',{'reason':reason})
  def _invalidate(self,pid,reason,clear_plan=True):
@@ -150,7 +157,7 @@ class Pipeline:
   if s['state']!='IMAGE_READY': raise PermissionError('QA requires ready image')
   payload={'checks':dict(evidence.checks),'score':evidence.score,'evaluator':evidence.evaluator}
   with self.db.transaction():
-   self._fence_evidence_mutation(s['project_id'],'QA evidence changed')
+   self._fence_evidence_mutation(s['project_id'],'QA evidence changed',scene_id=sid)
    self.db.execute("update scenes set qa_state=?,qa_json=? where id=?",('PASS' if evidence.passed else 'FAIL',json.dumps(payload),sid))
  def _planned_ready(self,pid):
   """Require persisted, internally valid source timing and a complete scene plan."""
@@ -159,8 +166,16 @@ class Pipeline:
   try: validate_timing(audio['duration_ms'],[(x['start_ms'],x['end_ms'],x['text']) for x in cues])
   except Exception: return False
   return project['min_scenes']<=len(scenes)<=project['max_scenes'] and [x['ord'] for x in scenes]==list(range(1,len(scenes)+1))
+ def _scene_evidence_hash(self,sid):
+  s=dict(self.db.one('select id,project_id,code,ord,start_ms,end_ms,text,special,state,qa_state,qa_json,duration_exception,continuity_json,checkpoint_json from scenes where id=?',(sid,)))
+  artifacts=[dict(x) for x in self.db.all("select id,kind,sha256,version,parent_id,status from artifacts where scene_id=? and status='ACTIVE' order by id",(sid,))]
+  return hashlib.sha256(json.dumps({'scene':s,'artifacts':artifacts},sort_keys=True,separators=(',',':')).encode()).hexdigest()
  def _pilot_ready(self,pid):
-  return self._planned_ready(pid) and not self.db.one("select 1 from scenes where project_id=? and (ord<=5 or special=1) and not(state='IMAGE_READY' and qa_state='PASS' and approval_state='APPROVED')",(pid,))
+  if not self._planned_ready(pid): return False
+  for s in self.db.all("select * from scenes where project_id=? and (ord<=5 or special=1)",(pid,)):
+   if s['state']!='IMAGE_READY' or s['qa_state']!='PASS' or s['approval_state']!='APPROVED': return False
+   if not self.db.one("select 1 from approvals where project_id=? and scene_id=? and gate='SCENE' and decision='APPROVED' and revoked_at is null and evidence_sha256=?",(pid,s['id'],self._scene_evidence_hash(s['id']))): return False
+  return True
  def start_batch(self,pid,role=Role.OPERATOR):
   self._role(role,'batch')
   if not self._pilot_ready(pid): raise PermissionError('pilot S001-S005 and special representatives require approval')
@@ -203,7 +218,7 @@ class Pipeline:
   if self.db.execute("update jobs set state='PAUSED',updated_at=? where id=? and state in ('QUEUED','RUNNING')",(now(),jid)).rowcount!=1: raise PermissionError('illegal job pause transition')
  def resume_job(self,jid,role=Role.OPERATOR):
   self._role(role,'resume')
-  if self.db.execute("update jobs set state='QUEUED',updated_at=? where id=? and state='PAUSED'",(now(),jid)).rowcount!=1: raise PermissionError('illegal job resume transition')
+  if self.db.execute("update jobs set state='QUEUED',updated_at=? where id=? and state='PAUSED' and project_version=(select version from projects where id=jobs.project_id) and exists(select 1 from projects where id=jobs.project_id and state='ACTIVE')",(now(),jid)).rowcount!=1: raise PermissionError('illegal job resume transition')
  def execute_images(self,scene_ids,outcomes):
   """Deterministic local executor; one scene failure never aborts siblings."""
   pending=iter(scene_ids); exhausted=False
@@ -231,7 +246,8 @@ class Pipeline:
    version=self.db.one('select version from projects where id=?',(pid,))['version']
    job=self.db.one("select * from jobs where project_id=? and project_version=? and state in ('QUEUED','RUNNING','PAUSED') order by id desc",(pid,version))
    jid=job['id'] if job else self._create_job(pid,'PIPELINE')
-   snapshot={**data,'data':data,'project':dict(self.db.one('select * from projects where id=?',(pid,))),'job':dict(self.db.one('select * from jobs where id=?',(jid,))),'scenes':[dict(x) for x in self.db.all('select * from scenes where project_id=?',(pid,))]}
+   payload={'snapshot_version':3,'data':data,'project':dict(self.db.one('select * from projects where id=?',(pid,))),'job':dict(self.db.one('select * from jobs where id=?',(jid,))),'scenes':[dict(x) for x in self.db.all('select * from scenes where project_id=? order by ord',(pid,))],'artifacts':[dict(x) for x in self.db.all('select * from artifacts where project_id=? order by id',(pid,))]}
+   snapshot={**data,**payload,'snapshot_sha256':hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()}
    self.db.execute("insert into stages(job_id,name,state,checkpoint_json) values(?,?,?,?) on conflict(job_id,name) do update set state=excluded.state,checkpoint_json=excluded.checkpoint_json",(jid,stage,'SUCCEEDED',json.dumps(snapshot)))
  def propose_rerun(self,pid,stage,role=Role.OPERATOR): self._role(role,'retry'); return self.db.execute("insert into proposals(project_id,stage,state,created_at) values(?,?,?,?)",(pid,stage,'PROPOSED',now())).lastrowid
  def decide_rerun(self,i,approved,actor,role=Role.OWNER):
@@ -257,7 +273,9 @@ class Pipeline:
   # Ingest into owned storage; callers' arbitrary source URI is never later deleted.
   copied=False
   try: source.relative_to(root); managed=source
-  except ValueError:
+  except ValueError: managed=None
+  # New registrations get exclusive ownership. Legacy shared URIs remain safe.
+  if managed is None or self.db.one("select 1 from artifacts where project_id=? and uri=? limit 1",(pid,str(managed))):
    managed=root/(uuid.uuid4().hex+source.suffix); shutil.copyfile(source,managed); copied=True
    if _new_copies is not None: _new_copies.append(managed)
   try:
@@ -275,41 +293,126 @@ class Pipeline:
   if not a or a['status']=='DELETED' or not os.path.isfile(a['uri']): raise FileNotFoundError('artifact binary unavailable')
   with self.db.transaction():
    self._invalidate(a['project_id'],'artifact restored',clear_plan=False)
-   self.db.execute("update projects set state='ACTIVE' where id=?",(a['project_id'],))
+   # Artifact restoration is content restoration, never a lifecycle transition.
    self.db.execute("update artifacts set status='SUPERSEDED' where project_id=? and kind=? and scene_id is ? and status='ACTIVE'",(a['project_id'],a['kind'],a['scene_id']))
    self.db.execute("update artifacts set status='ACTIVE',deleted_at=NULL where id=?",(artifact_id,))
    self._event(a['project_id'],'ARTIFACT_RESTORED',{'artifact':artifact_id})
   return dict(self.db.one('select * from artifacts where id=?',(artifact_id,)))
- def cleanup(self,role=Role.OWNER):
+ def cleanup(self,role=Role.OWNER,_lease_token=None):
   self._role(role,'cleanup')
+  owned=_lease_token is None
+  token=_lease_token or self.db.acquire_reconciliation_lease()
+  try:return self._cleanup(token)
+  finally:
+   if owned:self.db.release_reconciliation_lease(token)
+ def _cleanup(self,token):
   immutable=('INPUT','MANIFEST','DB','PROMPT','BIBLE','QA_METADATA','CHECKSUM','FINAL')
-  rows=self.db.all("select * from artifacts where status='ACTIVE' and expires_at<? and upper(kind) not in (%s)" % ','.join('?'*len(immutable)),(now(),*immutable))
+  rows=self.db.all("select * from artifacts where status in ('ACTIVE','SUPERSEDED') and expires_at<? and upper(kind) not in (%s)" % ','.join('?'*len(immutable)),(now(),*immutable))
   count=0
   for r in rows:
    try: path=self._owned_path(r['project_id'],r['uri'],must_exist=False)
-   except PermissionError: continue
-   # Rename first (same filesystem), commit audit state, then unlink staged data.
+   except (PermissionError,OSError): continue
    staged=path.with_name(path.name+'.deleting-'+uuid.uuid4().hex)
-   if path.is_file(): path.replace(staged)
+   moved=False
    try:
+    # BEGIN IMMEDIATE serializes the row transition, shared-reference decision,
+    # and rename.  A waiter therefore observes either the live reference or the
+    # committed DELETED transition, never the old decision with the new state.
     with self.db.transaction():
-     if self.db.execute("update artifacts set status='DELETED',deleted_at=? where id=? and status='ACTIVE'",(now(),r['id'])).rowcount!=1: raise RuntimeError('cleanup race')
+     self.db.assert_reconciliation_lease(token)
+     changed=self.db.execute("update artifacts set status='DELETED',deleted_at=? where id=? and status=?",(now(),r['id'],r['status'])).rowcount
+     if not changed: continue # another cleanup connection already retired it
+     live=self.db.one("select 1 from artifacts where project_id=? and uri=? and status!='DELETED' limit 1",(r['project_id'],r['uri']))
+     if not live and path.is_file() and not path.is_symlink():
+      path.replace(staged); moved=True
    except Exception:
-    if staged.exists(): staged.replace(path)
+    # A rename followed by rollback represents a live DB reference again.
+    if moved and staged.is_file() and not staged.is_symlink() and not path.exists(): staged.replace(path)
     raise
-   staged.unlink(missing_ok=True); count+=1
+   if moved: staged.unlink(missing_ok=True)
+   count+=1
   return count
- def cleanup_schedule(self): return {'task':'artifact_cleanup','interval_seconds':3600,'handler':self.cleanup}
+ def reconcile_deletions(self,_lease_token=None):
+  """Resolve rename/commit/unlink crash windows with DB status as authority."""
+  owned=_lease_token is None
+  token=_lease_token or self.db.acquire_reconciliation_lease()
+  try:
+   return self._reconcile_deletions(token)
+  finally:
+   if owned:self.db.release_reconciliation_lease(token)
+ def _reconcile_deletions(self,token):
+  """Implementation fenced by the SQLite lease before every filesystem write."""
+  for project in self.db.all("select id,artifact_root from projects where artifact_root is not null"):
+   root=Path(project['artifact_root']).resolve()
+   if not root.is_dir(): continue
+   groups={}
+   # Walk recursively without following directory symlinks, then handle all
+   # copies for one original together in stable pathname order.
+   for directory,dirs,files in os.walk(root,followlinks=False):
+    dirs[:]=[d for d in dirs if not (Path(directory)/d).is_symlink()]
+    for filename in files:
+     if '.deleting-' not in filename: continue
+     staged=Path(directory)/filename
+     if staged.is_symlink() or not staged.is_file(): continue
+     original=staged.with_name(filename.rsplit('.deleting-',1)[0])
+     try:
+      staged.resolve().relative_to(root)
+      original.resolve(strict=False).relative_to(root)
+     except (ValueError,OSError): continue
+     if original.is_symlink() or (original.exists() and not original.is_file()): continue
+     groups.setdefault(original,[]).append(staged)
+   for original,staged_files in sorted(groups.items(),key=lambda item:str(item[0])):
+    self.db.renew_reconciliation_lease(token)
+    rows=self.db.all('select status,sha256 from artifacts where project_id=? and uri=? order by id',(project['id'],str(original)))
+    if not rows: continue
+    staged_files=sorted(staged_files,key=lambda p:p.name)
+    live=[row for row in rows if row['status']!='DELETED']
+    if not live:
+     for staged in staged_files:
+      with self.db.transaction():
+       self.db.assert_reconciliation_lease(token); staged.unlink(missing_ok=True)
+     continue
+    live_hashes={row['sha256'] for row in live}
+    # Only a byte-for-byte tracked live payload may be restored or discarded.
+    # Unknown/mismatched files are deliberately left for operator inspection.
+    original_hash=None
+    if original.is_file() and not original.is_symlink():
+     try: original_hash=self._hash(original)[0]
+     except OSError: pass
+    candidates=[]
+    for staged in staged_files:
+     try: digest=self._hash(staged)[0]
+     except OSError: continue
+     if digest in live_hashes: candidates.append((staged,digest))
+    if original_hash not in live_hashes and not original.exists() and candidates:
+     chosen,original_hash=candidates[0]
+     with self.db.transaction():
+      self.db.assert_reconciliation_lease(token); chosen.replace(original)
+    if original_hash in live_hashes:
+     for staged,digest in candidates:
+      if digest==original_hash and staged.exists():
+       with self.db.transaction():
+        self.db.assert_reconciliation_lease(token); staged.unlink(missing_ok=True)
+ def scheduled_cleanup(self,role=Role.OWNER):
+  """Scheduled recovery and retention pass; safe to invoke repeatedly."""
+  token=self.db.acquire_reconciliation_lease()
+  try:
+   self.reconcile_deletions(_lease_token=token)
+   return self.cleanup(role,_lease_token=token)
+  finally:self.db.release_reconciliation_lease(token)
+ def cleanup_schedule(self): return {'task':'artifact_cleanup','interval_seconds':3600,'handler':self.scheduled_cleanup}
  def decide_scene(self,pid,code,decision,actor,role=Role.REVIEWER):
   self._role(role,'approve' if decision=='APPROVED' else 'reject'); s=self.db.one("select * from scenes where project_id=? and code=?",(pid,code))
   if not s: raise ValueError('scene not found')
   if decision not in ('APPROVED','REJECTED'): raise ValueError('decision')
   with self.db.transaction():
-   self._fence_evidence_mutation(pid,'scene approval changed')
-   self.db.execute("update scenes set approval_state=? where id=?",(decision,s['id'])); self.db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at) values(?,?,?,?,?,?)",(pid,s['id'],"SCENE",decision,actor,now()))
+   self._fence_evidence_mutation(pid,'scene approval changed',preserve_scene_approvals=True)
+   self.db.execute("update scenes set approval_state=? where id=?",(decision,s['id'])); evidence=self._scene_evidence_hash(s['id']); version=self.db.one('select version from projects where id=?',(pid,))['version']; self.db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,?,?,?,?,?,?,?)",(pid,s['id'],"SCENE",decision,actor,now(),version,evidence))
  def cancel_project(self,pid,role=Role.OWNER):
   self._role(role,'project-cancel')
-  if self.db.execute("update projects set state='COMPLETED' where id=? and state!='COMPLETED'",(pid,)).rowcount!=1: raise PermissionError('project cannot be cancelled')
+  with self.db.transaction():
+   if self.db.execute("update projects set state='COMPLETED' where id=? and state!='COMPLETED'",(pid,)).rowcount!=1: raise PermissionError('project cannot be cancelled')
+   self.db.execute("update jobs set state='BLOCKED',updated_at=?,lease_owner=NULL,lease_expires_at=NULL where project_id=? and state in ('QUEUED','RUNNING','PAUSED')",(now(),pid))
  def select_provider(self,pid,provider,role=Role.OPERATOR):
   self._role(role,'provider-select'); self._active(pid)
   if not provider.strip(): raise ValueError('provider required')
@@ -342,7 +445,7 @@ class Pipeline:
   self._role(role,'scene-replace'); s=self.scene(int(sid)); self._active(s['project_id']); new_copies=[]
   try:
    with self.db.transaction():
-    self._fence_evidence_mutation(s['project_id'],'scene artifact replaced')
+    self._fence_evidence_mutation(s['project_id'],'scene artifact replaced',scene_id=s['id'])
     old=self.db.one("select * from artifacts where scene_id=? and kind='IMAGE' and status='ACTIVE' order by version desc",(s['id'],))
     if old:self.db.execute("update artifacts set status='SUPERSEDED' where id=?",(old['id'],))
     aid=self.add_artifact(s['project_id'],'IMAGE',uri,s['id'],old['id'] if old else None,role,_new_copies=new_copies)
@@ -359,7 +462,25 @@ class Pipeline:
      pass
    raise
   return aid
- def dispatch_discord(self,text,role):
+ def dispatch_discord(self,text,role,idempotency_key=None):
+  """Dispatch a command, optionally behind an atomic canonical-effect receipt.
+
+  Transport delivery/response is at-least-once.  When supplied, the stable key
+  makes all core mutations and their result exactly-once; reuse for a different
+  request fails closed.
+  """
+  if idempotency_key is not None:
+   if not isinstance(idempotency_key,str) or not idempotency_key.strip(): raise ValueError('idempotency key required')
+   role_value=role.value if isinstance(role,Role) else str(role)
+   request_sha=hashlib.sha256(json.dumps({'text':text,'role':role_value},sort_keys=True,separators=(',',':')).encode()).hexdigest()
+   with self.db.transaction():
+    receipt=self.db.one('select request_sha256,response_json from command_receipts where idempotency_key=?',(idempotency_key,))
+    if receipt:
+     if receipt['request_sha256']!=request_sha: raise PermissionError('idempotency key reused for different request')
+     return json.loads(receipt['response_json'])
+    result=self.dispatch_discord(text,role)
+    self.db.execute('insert into command_receipts(idempotency_key,request_sha256,response_json,created_at) values(?,?,?,?)',(idempotency_key,request_sha,json.dumps(result),now()))
+    return result
   c=parse_discord(text); self._role(role,c.name)
   legacy={'approve':'scene-approve','reject':'scene-reject','pause':'project-pause','resume':'project-resume','retry':'scene-retry','status':'project-status'}
   c=type(c)(legacy.get(c.name,c.name),c.args)
@@ -412,18 +533,40 @@ class Pipeline:
 
  def restore_latest_checkpoint(self,pid,stage,role=Role.OPERATOR):
   self._role(role,'checkpoint-list')
-  r=self.db.one('select stages.* from stages join jobs on jobs.id=stages.job_id where jobs.project_id=? and stages.name=? and stages.state=\'SUCCEEDED\' order by stages.id desc',(pid,stage))
+  r=self.db.one("select stages.* from stages join jobs on jobs.id=stages.job_id where jobs.project_id=? and stages.name=? and stages.state='SUCCEEDED' order by stages.id desc",(pid,stage))
   if not r: raise ValueError('checkpoint not found')
-  snap=json.loads(r['checkpoint_json'])
+  snap=json.loads(r['checkpoint_json']); keys={'snapshot_version','data','project','job','scenes','artifacts','snapshot_sha256'}
+  if not keys.issubset(snap) or set(snap)-keys!=set(snap.get('data',{})) or any(snap[k]!=snap['data'][k] for k in set(snap)-keys) or snap['snapshot_version']!=3: raise ValueError('incomplete checkpoint snapshot')
+  payload={k:snap[k] for k in keys-{'snapshot_sha256'}}; digest=hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+  if not isinstance(snap['snapshot_sha256'],str) or digest!=snap['snapshot_sha256']: raise ValueError('checkpoint checksum mismatch')
+  current=self.db.one('select * from projects where id=?',(pid,)); project_fields=('language','style_json','references_json','bible_json','image_provider','whiteboard_mode','seed','transition','min_scenes','max_scenes','retention_days','output_json')
+  if not current or snap['project'].get('id')!=pid or any(k not in snap['project'] for k in project_fields): raise ValueError('checkpoint project mismatch/incomplete')
+  scene_fields=('id','project_id','code','ord','start_ms','end_ms','text','special','state','approval_state','qa_state','qa_json','duration_exception','continuity_json','checkpoint_json'); canonical=('id','project_id','code','ord','start_ms','end_ms','text','special','duration_exception')
+  if any(any(k not in s for k in scene_fields) for s in snap['scenes']): raise ValueError('incomplete checkpoint scenes')
+  live_scenes=[dict(x) for x in self.db.all('select * from scenes where project_id=? order by ord',(pid,))]
+  if [tuple(s[k] for k in canonical) for s in snap['scenes']] != [tuple(s[k] for k in canonical) for s in live_scenes] or [s['ord'] for s in snap['scenes']]!=list(range(1,len(snap['scenes'])+1)): raise ValueError('checkpoint scene identity/set/order mismatch')
+  af=('id','project_id','scene_id','kind','uri','sha256','version','parent_id','status','created_at','expires_at','deleted_at'); immutable=tuple(k for k in af if k not in ('status','deleted_at'))
+  if any(any(k not in a for k in af) for a in snap['artifacts']): raise ValueError('incomplete checkpoint artifacts')
+  live=[dict(x) for x in self.db.all('select * from artifacts where project_id=? order by id',(pid,))]
+  if [tuple(a[k] for k in immutable) for a in snap['artifacts']] != [tuple(a[k] for k in immutable) for a in live]: raise ValueError('checkpoint artifact inventory mismatch')
+  ids={a['id'] for a in snap['artifacts']}; sids={s['id'] for s in snap['scenes']}
+  if any(a['project_id']!=pid or (a['scene_id'] is not None and a['scene_id'] not in sids) or (a['parent_id'] is not None and a['parent_id'] not in ids) for a in snap['artifacts']): raise ValueError('checkpoint artifact lineage mismatch')
+  for a in snap['artifacts']:
+   if a['status']!='DELETED':
+    try: path=self._owned_path(pid,a['uri']); actual=self._hash(path)[0]
+    except (OSError,PermissionError) as exc: raise ValueError('checkpoint artifact binary unavailable') from exc
+    if actual!=a['sha256']: raise ValueError('checkpoint artifact binary checksum mismatch')
   with self.db.transaction():
-   if all(k in snap for k in ('project','job','scenes')):
-    p=snap['project']
-    if self.db.execute('update projects set state=?,blocked_reason=?,version=? where id=?',(p['state'],p['blocked_reason'],p['version'],pid)).rowcount!=1: raise ValueError('project not found')
-    j=snap['job']
-    if self.db.execute('update jobs set state=?,updated_at=? where id=? and project_id=?',(j['state'],now(),j['id'],pid)).rowcount!=1: raise ValueError('checkpoint job missing')
-    for s in snap['scenes']:
-     if self.db.execute('update scenes set state=?,approval_state=?,qa_state=?,qa_json=?,checkpoint_json=? where id=? and project_id=?',(s['state'],s['approval_state'],s['qa_state'],s.get('qa_json','{}'),s['checkpoint_json'],s['id'],pid)).rowcount!=1: raise ValueError('checkpoint scene missing')
-   self._event(pid,'CHECKPOINT_RESTORED',{'stage':stage})
+   version=current['version']+1
+   self.db.execute("update jobs set state='BLOCKED',updated_at=?,lease_owner=NULL,lease_expires_at=NULL where project_id=? and state in ('QUEUED','RUNNING','PAUSED')",(now(),pid)); self.db.execute("update approvals set revoked_at=?,revoked_reason=? where project_id=? and revoked_at is null",(now(),'checkpoint restored',pid))
+   # Restore content/configuration only.  The live lifecycle state and its
+   # blocked_reason are deliberately absent, so historical ACTIVE snapshots can
+   # never resurrect PAUSED/BLOCKED/COMPLETED projects.
+   self.db.execute('update projects set '+','.join(f'{k}=?' for k in project_fields)+',version=? where id=?',tuple(snap['project'][k] for k in project_fields)+(version,pid))
+   mutable=('state','approval_state','qa_state','qa_json','continuity_json','checkpoint_json')
+   for s in snap['scenes']: self.db.execute('update scenes set '+','.join(f'{k}=?' for k in mutable)+' where id=? and project_id=?',tuple(s[k] for k in mutable)+(s['id'],pid))
+   for a in snap['artifacts']: self.db.execute('update artifacts set status=?,deleted_at=? where id=? and project_id=?',(a['status'],a['deleted_at'],a['id'],pid))
+   self._event(pid,'CHECKPOINT_RESTORED',{'stage':stage,'snapshot_sha256':snap['snapshot_sha256'],'manifest_sha256':self._manifest_hash(pid),'project_version':version})
   return dict(r)
  def observe_cost(self,pid,provider,currency,amount,role=Role.OPERATOR): self._role(role,'costs'); self.db.execute("insert into cost_observations(project_id,provider,currency,amount,created_at) values(?,?,?,?,?)",(pid,provider,currency,amount,now()))
  def propose_dependency(self,pid,dependency,impact,proposer="system",role=Role.OPERATOR): self._role(role,'dependency-propose'); return self.db.execute("insert into impact_proposals(project_id,dependency,impact_json,state,proposer,created_at) values(?,?,?,?,?,?)",(pid,dependency,json.dumps(impact),"PROPOSED",proposer,now())).lastrowid
@@ -441,12 +584,14 @@ class Pipeline:
   self._role(role,'pause')
   with self.db.transaction():
    if self.db.execute("update projects set state='PAUSED' where id=? and state='ACTIVE'",(pid,)).rowcount!=1: raise PermissionError('only ACTIVE projects can pause')
+   self.db.execute("update jobs set state='PAUSED',updated_at=?,lease_owner=NULL,lease_expires_at=NULL where project_id=? and state in ('QUEUED','RUNNING')",(now(),pid))
    self._event(pid,"PAUSED")
  def resume(self,pid,role=Role.OPERATOR):
   self._role(role,'resume'); p=self.db.one('select * from projects where id=?',(pid,))
   if not p or p['state']!='PAUSED': raise PermissionError('only PAUSED projects can resume')
   with self.db.transaction():
    if self.db.execute("update projects set state='ACTIVE' where id=? and state='PAUSED'",(pid,)).rowcount!=1: raise PermissionError('only PAUSED projects can resume')
+   self.db.execute("update jobs set state='QUEUED',updated_at=? where project_id=? and state='PAUSED' and project_version=?",(now(),pid,p['version']))
    self._event(pid,"RESUMED")
  def status(self,pid,role=Role.OPERATOR): self._role(role,'status'); return {"project":dict(self.db.one("select * from projects where id=?",(pid,))),"scenes":[dict(x) for x in self.db.all("select * from scenes where project_id=? order by ord",(pid,))],"jobs":[dict(x) for x in self.db.all('select * from jobs where project_id=?',(pid,))]}
  def report(self,pid,role=Role.OPERATOR):

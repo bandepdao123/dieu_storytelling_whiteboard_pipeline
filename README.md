@@ -47,3 +47,16 @@ SQLite persistence, typed QA evidence, approval gates, bounded scheduling and
 checkpoint snapshots. Google/Discord/provider network integrations and the
 precision whiteboard rendering engine are intentionally **not implemented**;
 adapters remain local contracts/fakes and no claim of production media fidelity is made.
+# Discord v7 migration safety
+
+Legacy (pre-v7) Discord rows found in `PROCESSING` cannot be classified safely:
+the old schema does not prove whether the command's canonical side effect was
+committed.  Migration therefore marks them `MANUAL_REVIEW`, records
+`V7_LEGACY_PROCESSING_SIDE_EFFECT_UNKNOWN` in `error`, and clears their leases.
+The bridge will not execute or automatically retry these message IDs.
+
+An operator must compare the original command with project events/state and any
+external evidence.  If the effect happened, record/return an appropriate final
+response; if it demonstrably did not, submit the command under a **new** Discord
+message ID (and retain the blocked row for audit).  Do not reset a blocked row to
+`PROCESSING` unless the side-effect history has been conclusively reconciled.

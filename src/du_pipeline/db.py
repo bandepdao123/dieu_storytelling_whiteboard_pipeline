@@ -1,10 +1,12 @@
-import sqlite3
+import sqlite3,uuid
 from contextlib import contextmanager
 from pathlib import Path
+from datetime import datetime,timezone,timedelta
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 class SchemaVersionError(RuntimeError): pass
+class LeaseUnavailable(RuntimeError): pass
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS projects(
@@ -31,6 +33,7 @@ CREATE TABLE IF NOT EXISTS learning_metadata(id INTEGER PRIMARY KEY,project_id T
 CREATE TABLE IF NOT EXISTS integration_projects(project_id TEXT PRIMARY KEY REFERENCES projects(id),spreadsheet_id TEXT);
 CREATE TABLE IF NOT EXISTS integration_commands(source TEXT,external_id TEXT,project_id TEXT REFERENCES projects(id),created_at TEXT,PRIMARY KEY(source,external_id));
 CREATE TABLE IF NOT EXISTS discord_messages(message_id TEXT PRIMARY KEY,user_id TEXT,response_json TEXT,created_at TEXT);
+CREATE TABLE IF NOT EXISTS reconciliation_leases(name TEXT PRIMARY KEY,owner_token TEXT NOT NULL,expires_at TEXT NOT NULL);
 '''
 APPEND=("events","cost_observations","time_observations","learning_metadata")
 class Database:
@@ -48,7 +51,7 @@ class Database:
      if statement.strip(): self.conn.execute(statement)
     self.conn.execute('PRAGMA user_version=1'); version=1
    # Explicit 1 -> 2 additive upgrade from the original schema; 2 is verified below.
-   if version not in (1,2,3,4,5,6): raise SchemaVersionError(f'unsupported schema version {version}')
+   if version not in (1,2,3,4,5,6,7,8): raise SchemaVersionError(f'unsupported schema version {version}')
    cols={r[1] for r in self.conn.execute('pragma table_info(projects)')}
    if version == 2 and 'artifact_root' not in cols: raise SchemaVersionError('schema version 2 does not match structure')
    additions=[('min_scenes','INTEGER NOT NULL DEFAULT 50'),('max_scenes','INTEGER NOT NULL DEFAULT 360'),('retention_days','INTEGER NOT NULL DEFAULT 3'),('output_json',"TEXT NOT NULL DEFAULT '{}'") ,('version','INTEGER NOT NULL DEFAULT 1'),('artifact_root','TEXT')]
@@ -63,6 +66,7 @@ class Database:
    self.conn.execute('CREATE TABLE IF NOT EXISTS integration_projects(project_id TEXT PRIMARY KEY REFERENCES projects(id),spreadsheet_id TEXT)')
    self.conn.execute('CREATE TABLE IF NOT EXISTS integration_commands(source TEXT,external_id TEXT,project_id TEXT REFERENCES projects(id),created_at TEXT,PRIMARY KEY(source,external_id))')
    self.conn.execute('CREATE TABLE IF NOT EXISTS discord_messages(message_id TEXT PRIMARY KEY,user_id TEXT,response_json TEXT,created_at TEXT)')
+   self.conn.execute('CREATE TABLE IF NOT EXISTS reconciliation_leases(name TEXT PRIMARY KEY,owner_token TEXT NOT NULL,expires_at TEXT NOT NULL)')
    dcols={r[1] for r in self.conn.execute('pragma table_info(discord_messages)')}
    if 'state' not in dcols:self.conn.execute("ALTER TABLE discord_messages ADD COLUMN state TEXT NOT NULL DEFAULT 'COMPLETED'")
    if 'error' not in dcols:self.conn.execute('ALTER TABLE discord_messages ADD COLUMN error TEXT')
@@ -76,6 +80,15 @@ class Database:
    dcols={r[1] for r in self.conn.execute('pragma table_info(discord_messages)')}
    if 'lease_owner' not in dcols:self.conn.execute('ALTER TABLE discord_messages ADD COLUMN lease_owner TEXT')
    if 'lease_expires_at' not in dcols:self.conn.execute('ALTER TABLE discord_messages ADD COLUMN lease_expires_at TEXT')
+   # Before v7 Discord PROCESSING meant only that the bridge had started.  There
+   # is no durable receipt from which to infer whether its side effect happened.
+   # Retrying such rows could repeat an approval or other canonical mutation, so
+   # migration deliberately fails closed and leaves an auditable resolution job.
+   if version < 7:
+    self.conn.execute("UPDATE discord_messages SET state='MANUAL_REVIEW',error='V7_LEGACY_PROCESSING_SIDE_EFFECT_UNKNOWN',lease_owner=NULL,lease_expires_at=NULL WHERE state='PROCESSING'")
+   # Core command effects are committed atomically with this receipt.  A bridge
+   # lease may be taken over, but the stable external key cannot mutate core twice.
+   self.conn.execute('CREATE TABLE IF NOT EXISTS command_receipts(idempotency_key TEXT PRIMARY KEY,request_sha256 TEXT NOT NULL,response_json TEXT NOT NULL,created_at TEXT NOT NULL)')
    acols={r[1] for r in self.conn.execute('pragma table_info(approvals)')}
    for name,ddl in [('project_version','INTEGER'),('evidence_sha256','TEXT'),('revoked_at','TEXT'),('revoked_reason','TEXT')]:
     if name not in acols:self.conn.execute(f'ALTER TABLE approvals ADD COLUMN {name} {ddl}')
@@ -136,3 +149,23 @@ class Database:
   return cur
  def one(self,sql,args=()): return self.conn.execute(sql,args).fetchone()
  def all(self,sql,args=()): return self.conn.execute(sql,args).fetchall()
+ def acquire_reconciliation_lease(self,ttl_seconds=300):
+  """Atomically acquire/reclaim the host-local reconciler lease."""
+  token=uuid.uuid4().hex; current=datetime.now(timezone.utc); expires=current+timedelta(seconds=ttl_seconds)
+  with self.transaction():
+   changed=self.conn.execute("INSERT INTO reconciliation_leases(name,owner_token,expires_at) VALUES('artifact-deletion',?,?) ON CONFLICT(name) DO UPDATE SET owner_token=excluded.owner_token,expires_at=excluded.expires_at WHERE reconciliation_leases.expires_at<=?",(token,expires.isoformat(),current.isoformat())).rowcount
+   if changed!=1: raise LeaseUnavailable('artifact deletion reconciliation lease unavailable')
+  return token
+ def renew_reconciliation_lease(self,token,ttl_seconds=300):
+  current=datetime.now(timezone.utc); expires=current+timedelta(seconds=ttl_seconds)
+  with self.transaction():
+   changed=self.conn.execute("UPDATE reconciliation_leases SET expires_at=? WHERE name='artifact-deletion' AND owner_token=? AND expires_at>?",(expires.isoformat(),token,current.isoformat())).rowcount
+   if changed!=1: raise LeaseUnavailable('artifact deletion reconciliation lease lost')
+ def assert_reconciliation_lease(self,token):
+  """Fence one filesystem operation; caller must hold a write transaction."""
+  current=datetime.now(timezone.utc).isoformat()
+  if not self.one("SELECT 1 FROM reconciliation_leases WHERE name='artifact-deletion' AND owner_token=? AND expires_at>?",(token,current)):
+   raise LeaseUnavailable('artifact deletion reconciliation lease lost')
+ def release_reconciliation_lease(self,token):
+  with self.transaction():
+   return self.conn.execute("DELETE FROM reconciliation_leases WHERE name='artifact-deletion' AND owner_token=?",(token,)).rowcount==1

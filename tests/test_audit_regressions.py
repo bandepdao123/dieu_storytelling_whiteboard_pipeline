@@ -5,7 +5,46 @@ import pytest
 
 from du_pipeline.db import Database
 from du_pipeline.service import Pipeline
-from du_pipeline.integrations import SheetsAdapter
+from du_pipeline.integrations import SheetsAdapter, DiscordBridge
+from du_pipeline.adapters import Role
+
+
+def test_discord_lease_takeover_does_not_repeat_canonical_effect(tmp_path, monkeypatch):
+    db=Database(tmp_path/'discord.db'); p=Pipeline(db)
+    bridge=DiscordBridge(p,{'owner':Role.OWNER},lease_seconds=300)
+    real=p.dispatch_discord
+    def expire_after_effect(*args,**kwargs):
+        result=real(*args,**kwargs)
+        db.execute("update discord_messages set lease_expires_at='2000-01-01' where message_id='m1'")
+        return result
+    monkeypatch.setattr(p,'dispatch_discord',expire_after_effect)
+    # Lose the transport lease after the atomic core effect but before response persistence.
+    assert bridge.dispatch('m1','owner','du-tao-du-an once')['type']=='DANG_XU_LY'
+    monkeypatch.setattr(p,'dispatch_discord',real)
+    result=DiscordBridge(p,{'owner':Role.OWNER}).dispatch('m1','owner','du-tao-du-an once')
+    assert result['ok'] and result['idempotency_key']=='discord:m1'
+    assert db.one('select count(*) n from projects')['n']==1
+    assert db.one("select count(*) n from events where type='PROJECT_CREATED'")['n']==1
+    assert db.one('select count(*) n from command_receipts')['n']==1
+
+
+def test_checkpoint_restore_preserves_stopped_lifecycle_and_reason(tmp_path):
+    for state,reason in [('PAUSED',None),('BLOCKED','needs operator'),('COMPLETED','terminal')]:
+        db=Database(tmp_path/f'{state}.db'); p=Pipeline(db)
+        pid=p.init_project(state,scene_range=(1,1)); p.checkpoint(pid,'content',{'marker':state})
+        db.execute('update projects set state=?,blocked_reason=?,language=? where id=?',(state,reason,'en',pid))
+        before=db.one('select version from projects where id=?',(pid,))['version']
+        p.restore_latest_checkpoint(pid,'content')
+        restored=db.one('select state,blocked_reason,language,version from projects where id=?',(pid,))
+        assert (restored['state'],restored['blocked_reason'])==(state,reason)
+        assert restored['language']=='vi' and restored['version']==before+1
+
+
+def test_artifact_restore_preserves_paused_lifecycle(tmp_path):
+    db,p,pid=pipeline(tmp_path); source=tmp_path/'restore.png'; source.write_bytes(b'x')
+    artifact=p.add_artifact(pid,'IMAGE',source); db.execute("update artifacts set status='SUPERSEDED' where id=?",(artifact,))
+    p.pause(pid); p.restore_artifact(artifact)
+    assert db.one('select state from projects where id=?',(pid,))['state']=='PAUSED'
 from du_pipeline.contracts import QAEvidence
 
 
@@ -29,10 +68,37 @@ def test_source_change_invalidates_and_same_import_is_idempotent(tmp_path):
 def test_audio_change_deletes_derived_scenes_and_cannot_authorize_batch(tmp_path):
     db,p,pid=pipeline(tmp_path); scene=p.plan_scenes(pid)[0]
     db.execute("update scenes set state='IMAGE_READY',qa_state='PASS',approval_state='APPROVED' where id=?",(scene['id'],))
+    db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at,evidence_sha256) values(?,?,?,?,?,?,?)",(pid,scene['id'],'SCENE','APPROVED','r','now',p._scene_evidence_hash(scene['id'])))
     assert p._pilot_ready(pid)
     p.import_audio(pid,'new',6000,'b'*64)
     assert db.one('select 1 from scenes where project_id=?',(pid,)) is None
     with pytest.raises(PermissionError): p.start_batch(pid)
+
+
+def test_revoked_scene_approval_cannot_open_batch(tmp_path):
+    db,p,pid=pipeline(tmp_path); scene=p.plan_scenes(pid)[0]
+    db.execute("update scenes set state='IMAGE_READY',qa_state='PASS' where id=?",(scene['id'],))
+    p.decide_scene(pid,scene['code'],'APPROVED','r')
+    assert p._pilot_ready(pid)
+    db.execute("update approvals set revoked_at='now' where scene_id=?",(scene['id'],))
+    with pytest.raises(PermissionError): p.start_batch(pid)
+
+
+def test_superseded_expired_artifact_is_cleaned(tmp_path):
+    db,p,pid=pipeline(tmp_path); src=tmp_path/'old.png'; src.write_bytes(b'x')
+    aid=p.add_artifact(pid,'IMAGE',src)
+    uri=db.one('select uri from artifacts where id=?',(aid,))['uri']
+    db.execute("update artifacts set status='SUPERSEDED',expires_at='2000-01-01' where id=?",(aid,))
+    assert p.cleanup()==1
+    assert db.one('select status from artifacts where id=?',(aid,))['status']=='DELETED'
+    assert not __import__('pathlib').Path(uri).exists()
+
+
+def test_pause_and_cancel_fence_jobs(tmp_path):
+    db,p,pid=pipeline(tmp_path); jid=p._create_job(pid,'X'); p.pause(pid)
+    assert db.one('select state from jobs where id=?',(jid,))['state']=='PAUSED'
+    p.resume(pid); p.cancel_project(pid)
+    assert db.one('select state from jobs where id=?',(jid,))['state']=='BLOCKED'
 
 
 def test_document_change_is_idempotent_then_invalidates(tmp_path):

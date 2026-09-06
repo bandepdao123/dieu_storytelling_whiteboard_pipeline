@@ -34,5 +34,6 @@ def test_cleanup_preserves_immutable_and_is_idempotent(tmp_path):
 def test_latest_checkpoint_and_rerun_version(tmp_path):
  p,pid=pipe(tmp_path,6000,(0,6000,'x')); p.checkpoint(pid,'image',{'n':1}); p.checkpoint(pid,'image',{'n':2})
  assert json.loads(p.restore_latest_checkpoint(pid,'image')['checkpoint_json'])['n']==2
+ before=p.db.one('select version from projects where id=?',(pid,))['version']
  q=p.propose_rerun(pid,'image'); p.decide_rerun(q,True,'o'); p.apply_rerun(q)
- assert p.db.one('select version from projects where id=?',(pid,))['version']==2
+ assert p.db.one('select version from projects where id=?',(pid,))['version']==before+1

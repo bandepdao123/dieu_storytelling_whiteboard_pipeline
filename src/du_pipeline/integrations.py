@@ -135,21 +135,30 @@ class DiscordBridge:
   existing=self.pipeline.db.one('select response_json,state,lease_expires_at,user_id from discord_messages where message_id=?',(message_id,))
   if existing and existing[3]!=user_id:audit('DENIED','message_owner');return {'type':'TU_CHOI','ok':False,'message':'Bạn không có quyền truy cập lệnh này.'}
   if existing and existing[0]:audit('REPLAY','cached');return json.loads(existing[0])
+  if existing and existing[1]=='MANUAL_REVIEW':audit('MANUAL_REVIEW','legacy_processing_unknown');return self.status(message_id)
   if existing and existing[2] and existing[2]>=datetime.now(timezone.utc).isoformat():audit('ACTIVE_LEASE','processing');return self.status(message_id)
   try:c=parse_discord(text)
   except CommandError as e:audit('INVALID',e.code);return {'type':'LOI_LENH','ok':False,'message':str(e)}
   if not authorize(Role(self.allowlist[user_id]),c.name):audit('DENIED','rbac');return {'type':'TU_CHOI','ok':False,'message':'Vai trò không được phép thực hiện lệnh này.'}
+  # Ownership belongs to this claim attempt, not the long-lived bridge.
+  claim_token=str(uuid.uuid4())
   expiry=(datetime.now(timezone.utc)+timedelta(seconds=self.lease_seconds)).isoformat();nowiso=datetime.now(timezone.utc).isoformat()
   with self.pipeline.db.transaction():
    old=self.pipeline.db.one('select response_json,state,lease_expires_at,user_id from discord_messages where message_id=?',(message_id,))
    if old and old[3]!=user_id:audit('DENIED','message_owner');return {'type':'TU_CHOI','ok':False,'message':'Bạn không có quyền truy cập lệnh này.'}
    if old and old[0]:audit('REPLAY','cached');return json.loads(old[0])
+   if old and old[1]=='MANUAL_REVIEW':audit('MANUAL_REVIEW','legacy_processing_unknown');return self.status(message_id)
    if old and old[2] and old[2]>=nowiso:audit('ACTIVE_LEASE','processing');return self.status(message_id)
-   if old:self.pipeline.db.execute("update discord_messages set state='PROCESSING',lease_owner=?,lease_expires_at=? where message_id=?",(self.owner,expiry,message_id))
-   else:self.pipeline.db.execute("insert into discord_messages(message_id,user_id,response_json,created_at,state,lease_owner,lease_expires_at) values(?,?,NULL,?,'PROCESSING',?,?)",(message_id,user_id,now(),self.owner,expiry))
-  try:r={'type':'THANH_CONG','ok':True,'message':'Đã thực thi lệnh.','data':self.pipeline.dispatch_discord(text,Role(self.allowlist[user_id]))}
+   if old:self.pipeline.db.execute("update discord_messages set state='PROCESSING',lease_owner=?,lease_expires_at=? where message_id=?",(claim_token,expiry,message_id))
+   else:self.pipeline.db.execute("insert into discord_messages(message_id,user_id,response_json,created_at,state,lease_owner,lease_expires_at) values(?,?,NULL,?,'PROCESSING',?,?)",(message_id,user_id,now(),claim_token,expiry))
+  # Derive and pass the stable key *before* dispatch.  Discord itself offers no
+  # exactly-once guarantee; Pipeline's receipt boundary guarantees that a lease
+  # takeover cannot repeat canonical DB/file mutations.
+  idempotency_key='discord:'+str(message_id)
+  try:r={'type':'THANH_CONG','ok':True,'message':'Đã thực thi lệnh.','data':self.pipeline.dispatch_discord(text,Role(self.allowlist[user_id]),idempotency_key=idempotency_key),'idempotency_key':idempotency_key}
   except Exception as e:r={'type':'LOI_LENH','ok':False,'message':type(e).__name__}
   with self.pipeline.db.transaction():
-   self.pipeline.db.execute('update discord_messages set response_json=?,state=?,error=?,lease_owner=NULL,lease_expires_at=NULL where message_id=?',(json.dumps(r),'COMPLETED' if r['ok'] else 'FAILED',None if r['ok'] else r['type'],message_id))
-   self.pipeline.db.execute('insert into integration_attempts(source,external_id,user_id,outcome,detail,created_at) values(?,?,?,?,?,?)',('DISCORD',message_id,user_id,'COMPLETED' if r['ok'] else 'FAILED',r['type'],now()))
-  return r
+   committed=self.pipeline.db.execute("update discord_messages set response_json=?,state=?,error=?,lease_owner=NULL,lease_expires_at=NULL where message_id=? and state='PROCESSING' and lease_owner=? and lease_expires_at>=?",(json.dumps(r),'COMPLETED' if r['ok'] else 'FAILED',None if r['ok'] else r['type'],message_id,claim_token,datetime.now(timezone.utc).isoformat())).rowcount
+   outcome=('COMPLETED' if r['ok'] else 'FAILED') if committed else 'STALE_LEASE'
+   self.pipeline.db.execute('insert into integration_attempts(source,external_id,user_id,outcome,detail,created_at) values(?,?,?,?,?,?)',('DISCORD',message_id,user_id,outcome,r['type'],now()))
+  return r if committed else self.status(message_id)
