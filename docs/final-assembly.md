@@ -11,6 +11,24 @@ ffprobe confirms H.264 1920x1080 30 fps yuv420p video, AAC audio, and duration w
 artifact identity/checksums/durations, narration checksum, configuration, commands,
 probe evidence, project version and lineage evidence hash.
 
+CLI: `du-pipeline --db pipeline.db assemble-final PROJECT_ID OUTPUT_PATH
+[--dry-run]` (`assemble` remains an alias). `OUTPUT_PATH` is positional and must be
+inside the managed project root. Canonical parent lineage is narration first, then
+exactly one selected visual per scene in `ord` order.
+
+Assembly requires a current, non-revoked `POST_BATCH` approval whose project version
+and evidence digest match the exact assembly inputs. Applicable scene approvals are
+also revalidated. `FINAL` is intentionally not a pre-assembly gate: it is the downstream
+human QA decision on the completed final artifact, so requiring it here would be circular.
+The input/request evidence digest is distinct from `manifest_sha256`; the latter is
+computed only after commands, ffprobe output, approval identities, narration metadata,
+and canonical lineage have been added to the persisted manifest.
+
+Dry-run performs no reconciliation, database writes, or directory creation. Publication
+rejects symlink traversal (including `.publications` and output parents), uses atomic
+no-replace promotion, and quarantines a promoted destination if evidence becomes stale
+before registration.
+
 Publication is a recoverable state machine rather than an impossible cross-resource
 transaction. Before the immutable destination is exposed, a committed `PREPARED`
 journal row records token, project/version/evidence, staging/final paths, output

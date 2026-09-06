@@ -1,4 +1,5 @@
 import hashlib,json,os,uuid,random,shutil
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from datetime import datetime,timezone,timedelta
 from .policies import validate_timing,required_approval,DurationPolicy
@@ -6,7 +7,7 @@ from .contracts import OutputConfig,ContactSheetArtifact,QAEvidence
 from .policies import ResourceScheduler
 from .adapters import Role,authorize,parse_discord,CommandError
 from .inputs import normalize_document
-from .atomic_fs import rename_noreplace
+from .atomic_fs import rename_noreplace,rename_noreplace_at,open_dir_beneath
 
 def now(): return datetime.now(timezone.utc).isoformat()
 class Pipeline:
@@ -16,16 +17,50 @@ class Pipeline:
   except Exception as e: raise PermissionError('valid role required') from e
   if not authorize(r,command): raise PermissionError(f'{r.value} cannot {command}')
  def _root(self,pid):
+  root=self._root_lookup(pid); root.mkdir(parents=True,exist_ok=True); return root
+ def _root_lookup(self,pid):
   p=self.db.one('select artifact_root from projects where id=?',(pid,))
   if not p: raise ValueError('project not found')
-  root=Path(p['artifact_root'] or (self.db.path.parent/'artifacts'/pid)).resolve(); root.mkdir(parents=True,exist_ok=True); return root
- def _owned_path(self,pid,path,must_exist=True):
-  root=self._root(pid); candidate=Path(path)
+  return Path(p['artifact_root'] or (self.db.path.parent/'artifacts'/pid)).absolute()
+ def _owned_path(self,pid,path,must_exist=True,root=None):
+  root=Path(root) if root is not None else self._root(pid); candidate=Path(path)
   if not candidate.is_absolute(): candidate=root/candidate
   candidate=candidate.resolve(strict=must_exist)
   try: candidate.relative_to(root)
   except ValueError as exc: raise PermissionError('path escapes managed artifact root') from exc
   return candidate
+ def _publication_parent_fd(self,pid,path,create=False):
+  root=self._root_lookup(pid); candidate=Path(path)
+  if not candidate.is_absolute(): candidate=root/candidate
+  try: rel=candidate.relative_to(root)
+  except ValueError as exc: raise PermissionError('path escapes managed artifact root') from exc
+  return open_dir_beneath(root,rel.parent,create=create),rel.name
+ @contextmanager
+ def _publication_fds(self,pid,staging,final,create_final=False):
+  """Pin both parents, including safe creation, and close partial opens."""
+  sfd=ffd=None
+  try:
+   sfd,sname=self._publication_parent_fd(pid,staging)
+   ffd,fname=self._publication_parent_fd(pid,final,create=create_final)
+   yield sfd,sname,ffd,fname
+  finally:
+   if ffd is not None: os.close(ffd)
+   if sfd is not None: os.close(sfd)
+ def _hash_at(self,fd,name):
+  with os.fdopen(os.open(name,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=fd),'rb') as stream:
+   h=hashlib.sha256(); size=0
+   for chunk in iter(lambda:stream.read(1024*1024),b''): h.update(chunk); size+=len(chunk)
+  return h.hexdigest(),size
+ def _safe_parent(self,root,path):
+  root=Path(root); parent=Path(path).parent
+  try: rel=parent.relative_to(root)
+  except ValueError as exc: raise PermissionError('path escapes managed artifact root') from exc
+  current=root
+  if current.is_symlink(): raise PermissionError('managed root symlink is forbidden')
+  for part in rel.parts:
+   current=current/part
+   if current.is_symlink(): raise PermissionError('symlinked output parent is forbidden')
+  return parent
  def _hash(self,path):
   h=hashlib.sha256(); size=0
   with open(path,'rb') as stream:
@@ -75,7 +110,11 @@ class Pipeline:
    self.db.execute("delete from scenes where project_id=?",(pid,))
  def assemble(self,pid,output,dry_run=False,role=Role.OPERATOR,assembler=None):
   from .media import LocalFinalAssembler,AssemblyError
-  self._role(role,'animate'); self.reconcile_publications(); self._active(pid); root=self._root(pid); out=self._owned_path(pid,output,False)
+  self._role(role,'animate')
+  if not dry_run: self.reconcile_publications()
+  self._active(pid); root=self._root_lookup(pid) if dry_run else self._root(pid)
+  if dry_run and not root.is_dir(): raise AssemblyError('managed artifact root is absent')
+  out=self._owned_path(pid,output,False,root=root); self._safe_parent(root,out)
   project=self.db.one('select * from projects where id=?',(pid,)); version=project['version']; audio=self.db.one('select * from audio where project_id=?',(pid,))
   if not audio: raise AssemblyError('narration audio required')
   ap=self._owned_path(pid,audio['uri']); ah=self._hash(ap)[0]
@@ -93,21 +132,25 @@ class Pipeline:
    rows=self.db.all("select * from artifacts where scene_id=? and status='ACTIVE' and kind in ('ANIMATION','SCENE_VIDEO','IMAGE') order by version desc,id",(s['id'],))
    videos=[a for a in rows if a['kind'] in ('ANIMATION','SCENE_VIDEO')]; pool=videos or [a for a in rows if a['kind']=='IMAGE']
    if not pool: raise AssemblyError('exactly one eligible current scene artifact required')
-   highest=max(a['version'] for a in pool); winners=[a for a in pool if a['version']==highest]
-   if len(winners)!=1: raise AssemblyError('duplicate highest-version scene artifact')
-   a=winners[0]; path=self._owned_path(pid,a['uri']); frames=round(s['end_ms']*30/1000)-round(s['start_ms']*30/1000)
+   if len(pool)!=1: raise AssemblyError('duplicate eligible current scene artifact')
+   a=pool[0]; path=self._owned_path(pid,a['uri']); frames=round(s['end_ms']*30/1000)-round(s['start_ms']*30/1000)
    if frames < 1: raise AssemblyError('scene rounds to zero frames')
    if self._hash(path)[0]!=a['sha256']: raise AssemblyError('scene artifact checksum mismatch')
    selected.append((s,a,path,a['kind']=='IMAGE',frames))
   if sum(x[4] for x in selected)!=frame_total: raise AssemblyError('frame allocation mismatch')
   engine=assembler or LocalFinalAssembler(root); current_evidence=self._manifest_hash(pid)
-  manifest={'project_id':pid,'project_version':version,'current_evidence_sha256':current_evidence,'requested_output':str(out),'audio':{'sha256':ah,'duration_ms':audio['duration_ms']},'scenes':[{'scene_id':s['id'],'ord':s['ord'],'source_artifact_id':a['id'],'source_kind':a['kind'],'source_version':a['version'],'parent_id':a['parent_id'],'sha256':a['sha256'],'frames':frames} for s,a,_,_,frames in selected],'output_config':{'width':1920,'height':1080,'fps':30,'video_codec':'h264','pixel_format':'yuv420p','audio_codec':'aac','tolerance_seconds':1/30+.020},'tool_versions':None if dry_run else engine.tool_versions()}
-  evidence=hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',',':')).encode()).hexdigest(); manifest['evidence_sha256']=evidence
+  approvals=[dict(x) for x in self.db.all("select id,gate,scene_id,actor,project_version,evidence_sha256 from approvals where project_id=? and decision='APPROVED' and revoked_at is null and project_version=? order by gate,scene_id,id",(pid,version))]
+  if not any(a['gate']=='POST_BATCH' and a['scene_id'] is None and a['evidence_sha256']==current_evidence for a in approvals): raise AssemblyError('current post-batch human approval required')
+  lineage=[{'type':'NARRATION_AUDIO','sha256':ah}]+[{'type':'SCENE_VISUAL','ord':s['ord'],'artifact_id':a['id'],'sha256':a['sha256']} for s,a,_,_,_ in selected]
+  manifest={'project_id':pid,'project_version':version,'current_evidence_sha256':current_evidence,'requested_output':str(out),'narration':{'uri':str(ap),'sha256':ah,'duration_ms':audio['duration_ms']},'audio':{'sha256':ah,'duration_ms':audio['duration_ms']},'approvals':approvals,'parent_lineage':lineage,'scenes':[{'scene_id':s['id'],'ord':s['ord'],'source_artifact_id':a['id'],'source_kind':a['kind'],'source_version':a['version'],'parent_id':a['parent_id'],'sha256':a['sha256'],'frames':frames} for s,a,_,_,frames in selected],'output_config':{'width':1920,'height':1080,'fps':30,'video_codec':'h264','pixel_format':'yuv420p','audio_codec':'aac','tolerance_seconds':1/30+.020},'tool_versions':None if dry_run else engine.tool_versions()}
+  evidence=hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',',':')).encode()).hexdigest(); manifest['input_evidence_sha256']=evidence
   old=self.db.one("select a.*,f.manifest_json from artifacts a join final_assemblies f on f.artifact_id=a.id where f.evidence_sha256=? and a.status='ACTIVE'",(evidence,))
   if old and Path(old['uri']).resolve()==out and self._hash(self._owned_path(pid,old['uri']))[0]==old['sha256']: return {'artifact_id':old['id'],'output':old['uri'],'reused':True,'manifest':json.loads(old['manifest_json'])}
   if out.exists(): raise AssemblyError('output already exists')
   commands=[engine.normalize_command(path,root/f'.segment-{i}.mp4',frames/30,image,frames=frames) for i,(s,a,path,image,frames) in enumerate(selected)]; commands += [engine.concat_command(root/'.concat.txt',root/'.visual.mp4'),engine.mux_command(root/'.visual.mp4',ap,root/'.final.tmp.mp4')]; manifest['commands']=commands
-  if dry_run:return {'dry_run':True,'output':str(out),'manifest':manifest,'commands':commands}
+  if dry_run:
+   manifest['manifest_sha256']=hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+   return {'dry_run':True,'output':str(out),'manifest':manifest,'commands':commands}
   work=Path(__import__('tempfile').mkdtemp(prefix='.assembly-',dir=root))
   try:
    # Snapshot validated bytes first; all ffmpeg inputs below are private immutable names.
@@ -119,8 +162,14 @@ class Pipeline:
     if self._hash(source)[0]!=a['sha256']: raise AssemblyError('scene source changed while snapshotting')
     q=work/f'{i:06}.mp4'; engine.run(engine.normalize_command(source,q,frames/30,image,frames=frames)); seg.append(q)
    listing=work/'concat.txt'; listing.write_text(''.join("file '{}'\n".format(str(p).replace("'", "'\\''")) for p in seg)); visual=work/'visual.mp4'; engine.run(engine.concat_command(listing,visual)); staged=work/'final.mp4'; engine.run(engine.mux_command(visual,snap_audio,staged)); manifest['ffprobe']=engine.validate_final(staged,audio['duration_ms']/1000)
-   token=uuid.uuid4().hex; pubdir=root/'.publications'; pubdir.mkdir(exist_ok=True); durable=pubdir/(token+'.staged.mp4')
-   os.replace(staged,durable); digest,size=self._hash(durable); created=now()
+   manifest['manifest_sha256']=hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+   token=uuid.uuid4().hex; pubdir=root/'.publications'; durable=pubdir/(token+'.staged.mp4')
+   with ExitStack() as fds:
+    pubfd=open_dir_beneath(root,'.publications',create=True); fds.callback(os.close,pubfd)
+    workfd=os.open(work,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW); fds.callback(os.close,workfd)
+    rename_noreplace_at(workfd,staged.name,pubfd,durable.name)
+    digest,size=self._hash_at(pubfd,durable.name)
+   created=now()
    with self.db.transaction():
     current=self.db.one('select version,state from projects where id=?',(pid,))
     if not current or current['version']!=version or current['state']!='ACTIVE' or self._manifest_hash(pid)!=current_evidence: raise AssemblyError('project/evidence changed during assembly')
@@ -132,7 +181,12 @@ class Pipeline:
     # Keep the journal recoverable while restoring the promise that a failed
     # synchronous call does not leave its requested destination exposed.
     try:
-     if out.is_file() and not out.is_symlink() and not durable.exists(): rename_noreplace(out,durable)
+     with ExitStack() as fds:
+      ffd,fname=self._publication_parent_fd(pid,out); fds.callback(os.close,ffd)
+      sfd,sname=self._publication_parent_fd(pid,durable); fds.callback(os.close,sfd)
+      try: exists=__import__('stat').S_ISREG(os.stat(fname,dir_fd=ffd,follow_symlinks=False).st_mode)
+      except FileNotFoundError: exists=False
+      if exists: rename_noreplace_at(ffd,fname,sfd,sname)
     except OSError as cleanup:
      with self.db.transaction():
       self.db.execute("update publication_journal set state='MANUAL_REVIEW',updated_at=?,error=? where token=? and state='PREPARED'",(now(),'REGISTRATION_FAILED; rollback rename failed: '+str(cleanup),token)); self._event(pid,'FINAL_PUBLICATION_MANUAL_REVIEW',{'token':token,'reason':str(cleanup)})
@@ -149,37 +203,56 @@ class Pipeline:
   owned=_lease_token is None; lease=_lease_token or self.db.acquire_reconciliation_lease()
   try:
    for row in self.db.all("select * from publication_journal where state='PREPARED' order by created_at,token"):
-    self.db.renew_reconciliation_lease(lease); r=dict(row); pid=r['project_id']; staging=self._owned_path(pid,r['staging_path'],False); final=self._owned_path(pid,r['final_path'],False)
+    self.db.renew_reconciliation_lease(lease); r=dict(row); pid=r['project_id']; staging=Path(r['staging_path']); final=Path(r['final_path'])
+    with self._publication_fds(pid,staging,final,create_final=True) as (sfd,sname,ffd,fname):
+     self._reconcile_publication_row(lease,r,pid,staging,final,sfd,sname,ffd,fname)
+   return [dict(x) for x in self.db.all('select * from publication_journal order by created_at,token')]
+  finally:
+   if owned:self.db.release_reconciliation_lease(lease)
+ def _reconcile_publication_row(self,lease,r,pid,staging,final,sfd,sname,ffd,fname):
     current=self.db.one('select version,state from projects where id=?',(pid,)); valid=bool(current and current['version']==r['project_version'] and current['state']=='ACTIVE' and self._manifest_hash(pid)==r['current_evidence_sha256'])
-    sf=staging.is_file() and not staging.is_symlink(); ff=final.is_file() and not final.is_symlink(); source=final if ff else staging if sf else None
-    matching=source is not None and self._hash(source)==(r['output_sha256'],r['output_size'])
+    try:
+     smode=os.stat(sname,dir_fd=sfd,follow_symlinks=False).st_mode; sf=__import__('stat').S_ISREG(smode)
+    except FileNotFoundError: sf=False
+    try:
+     fmode=os.stat(fname,dir_fd=ffd,follow_symlinks=False).st_mode; ff=__import__('stat').S_ISREG(fmode)
+    except FileNotFoundError: ff=False
+    source=final if ff else staging if sf else None
+    matching=source is not None and self._hash_at(ffd if ff else sfd,fname if ff else sname)==(r['output_sha256'],r['output_size'])
     if not valid or not matching or (sf and ff):
      reason='STALE_EVIDENCE' if not valid else 'MISSING_OR_TAMPERED_BYTES'; cleanup_error=None
      if not valid and matching and source==final:
       quarantine=final.with_name(final.name+'.aborted-'+r['token'])
       try:
-       if quarantine.exists(): raise FileExistsError(str(quarantine))
-       with self.db.transaction(): self.db.assert_reconciliation_lease(lease); final.replace(quarantine)
+       with self.db.transaction(): self.db.assert_reconciliation_lease(lease); rename_noreplace_at(ffd,fname,ffd,quarantine.name)
       except OSError as exc: cleanup_error=str(exc)
      state='MANUAL_REVIEW' if cleanup_error or (source is not None and not matching) else 'ABORTED'; error=reason+((': '+cleanup_error) if cleanup_error else '')
      with self.db.transaction():
       self.db.assert_reconciliation_lease(lease); self.db.execute("update publication_journal set state=?,updated_at=?,error=? where token=? and state='PREPARED'",(state,now(),error,r['token'])); self._event(pid,'FINAL_PUBLICATION_'+state,{'token':r['token'],'reason':error})
-     continue
+     return
     if not ff:
-     final.parent.mkdir(parents=True,exist_ok=True)
      try:
-      with self.db.transaction(): self.db.assert_reconciliation_lease(lease); rename_noreplace(staging,final)
+      with self.db.transaction(): self.db.assert_reconciliation_lease(lease); rename_noreplace_at(sfd,sname,ffd,fname)
      except FileExistsError as exc:
       error='DESTINATION_COLLISION: atomic no-replace promotion refused: '+str(exc)
       with self.db.transaction():
        self.db.assert_reconciliation_lease(lease); self.db.execute("update publication_journal set state='ABORTED',updated_at=?,error=? where token=? and state='PREPARED'",(now(),error,r['token'])); self._event(pid,'FINAL_PUBLICATION_ABORTED',{'token':r['token'],'reason':error})
-      continue
+      return
      except OSError as exc:
       error='ATOMIC_PROMOTION_UNAVAILABLE: '+str(exc)
       with self.db.transaction():
        self.db.assert_reconciliation_lease(lease); self.db.execute("update publication_journal set state='MANUAL_REVIEW',updated_at=?,error=? where token=? and state='PREPARED'",(now(),error,r['token'])); self._event(pid,'FINAL_PUBLICATION_MANUAL_REVIEW',{'token':r['token'],'reason':error})
-      continue
+      return
      self._publication_crash('after_rename_before_registration')
+    current=self.db.one('select version,state from projects where id=?',(pid,))
+    if not current or current['version']!=r['project_version'] or current['state']!='ACTIVE' or self._manifest_hash(pid)!=r['current_evidence_sha256']:
+     quarantine=final.with_name(final.name+'.aborted-'+r['token']); cleanup_error=None
+     try: rename_noreplace_at(ffd,fname,ffd,quarantine.name)
+     except OSError as exc: cleanup_error=str(exc)
+     state='MANUAL_REVIEW' if cleanup_error else 'ABORTED'; error='STALE_EVIDENCE_AFTER_PROMOTION'+((': '+cleanup_error) if cleanup_error else '')
+     with self.db.transaction():
+      self.db.assert_reconciliation_lease(lease); self.db.execute("update publication_journal set state=?,updated_at=?,error=? where token=? and state='PREPARED'",(state,now(),error,r['token'])); self._event(pid,'FINAL_PUBLICATION_'+state,{'token':r['token'],'reason':error})
+     return
     with self.db.transaction():
      self.db.assert_reconciliation_lease(lease); current=self.db.one('select version,state from projects where id=?',(pid,))
      if not current or current['version']!=r['project_version'] or current['state']!='ACTIVE' or self._manifest_hash(pid)!=r['current_evidence_sha256']: raise AssemblyError('project/evidence changed during publication')
@@ -188,9 +261,6 @@ class Pipeline:
      aid=self.db.execute("insert into artifacts(project_id,scene_id,kind,uri,sha256,version,parent_id,status,created_at,expires_at) values(?,NULL,'FINAL_VIDEO',?,?,?,NULL,'ACTIVE',?,?)",(pid,str(final),r['output_sha256'],version,now(),expires)).lastrowid
      self._event(pid,'ARTIFACT_ADDED',{'artifact':aid,'kind':'FINAL_VIDEO'})
      self.db.execute('insert into final_assemblies values(?,?,?,?,?,?)',(aid,pid,r['project_version'],r['evidence_sha256'],r['manifest_json'],now())); self.db.execute("update publication_journal set state='COMMITTED',artifact_id=?,updated_at=?,error=NULL where token=? and state='PREPARED'",(aid,now(),r['token'])); self._event(pid,'FINAL_ASSEMBLED',{'artifact':aid,'evidence_sha256':r['evidence_sha256'],'publication_token':r['token']})
-   return [dict(x) for x in self.db.all('select * from publication_journal order by created_at,token')]
-  finally:
-   if owned:self.db.release_reconciliation_lease(lease)
  def import_srt(self,pid,cues,role=Role.OPERATOR):
   self._role(role,'import'); self._active(pid)
   rows=list(cues)

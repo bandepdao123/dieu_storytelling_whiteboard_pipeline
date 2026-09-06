@@ -26,7 +26,7 @@ def parser():
  q=sub.add_parser('upload-drive'); q.add_argument('project_id'); q.add_argument('path'); q.add_argument('--folder',default='07_exports'); q.add_argument('--dry-run',action='store_true')
  q=sub.add_parser('discord-dispatch'); q.add_argument('message_id'); q.add_argument('user_id'); q.add_argument('text'); q.add_argument('--dry-run',action='store_true')
  q=sub.add_parser('discord-status'); q.add_argument('message_id')
- q=sub.add_parser('assemble'); q.add_argument('project_id'); q.add_argument('--output',required=True); q.add_argument('--dry-run',action='store_true')
+ q=sub.add_parser('assemble-final',aliases=['assemble']); q.add_argument('project_id'); q.add_argument('output'); q.add_argument('--dry-run',action='store_true')
  sub.add_parser('recover-publications')
  return p
 
@@ -70,7 +70,7 @@ def main(argv=None):
  elif a.cmd=='discord-status':
   from .integrations import DiscordBridge
   result=DiscordBridge(svc,{}).status(a.message_id)
- elif a.cmd=='assemble': result=svc.assemble(a.project_id,a.output,a.dry_run,a.role)
+ elif a.cmd in ('assemble','assemble-final'): result=svc.assemble(a.project_id,a.output,a.dry_run,a.role)
  elif a.cmd=='recover-publications': result={'publications':svc.reconcile_publications()}
  print(json.dumps(result,ensure_ascii=False)); return 0
 if __name__=='__main__': raise SystemExit(main())
