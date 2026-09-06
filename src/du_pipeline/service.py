@@ -6,6 +6,7 @@ from .contracts import OutputConfig,ContactSheetArtifact,QAEvidence
 from .policies import ResourceScheduler
 from .adapters import Role,authorize,parse_discord,CommandError
 from .inputs import normalize_document
+from .atomic_fs import rename_noreplace
 
 def now(): return datetime.now(timezone.utc).isoformat()
 class Pipeline:
@@ -72,6 +73,124 @@ class Pipeline:
    self.db.execute("update artifacts set scene_id=NULL where project_id=? and scene_id is not null",(pid,))
    self.db.execute("update approvals set scene_id=NULL where project_id=? and scene_id is not null",(pid,))
    self.db.execute("delete from scenes where project_id=?",(pid,))
+ def assemble(self,pid,output,dry_run=False,role=Role.OPERATOR,assembler=None):
+  from .media import LocalFinalAssembler,AssemblyError
+  self._role(role,'animate'); self.reconcile_publications(); self._active(pid); root=self._root(pid); out=self._owned_path(pid,output,False)
+  project=self.db.one('select * from projects where id=?',(pid,)); version=project['version']; audio=self.db.one('select * from audio where project_id=?',(pid,))
+  if not audio: raise AssemblyError('narration audio required')
+  ap=self._owned_path(pid,audio['uri']); ah=self._hash(ap)[0]
+  if ah!=audio['sha256']: raise AssemblyError('audio checksum mismatch')
+  scenes=self.db.all('select * from scenes where project_id=? order by ord',(pid,))
+  if not scenes or [s['ord'] for s in scenes]!=list(range(1,len(scenes)+1)): raise AssemblyError('exact ordered scene set required')
+  if scenes[0]['start_ms'] or scenes[-1]['end_ms']!=audio['duration_ms'] or any(a['end_ms']!=b['start_ms'] for a,b in zip(scenes,scenes[1:])): raise AssemblyError('scene/audio duration mismatch')
+  # Output is a new publication contract, never an input or historical artifact.
+  aliases=[ap]+[self._owned_path(pid,r['uri'],False) for r in self.db.all('select uri from artifacts where project_id=?',(pid,))]
+  if any(out==p or (out.exists() and p.exists() and os.path.samefile(out,p)) for p in aliases): raise AssemblyError('output aliases managed input/artifact')
+  selected=[]; frame_total=round(audio['duration_ms']*30/1000)
+  for s in scenes:
+   if s['state'] not in ('IMAGE_READY','ANIMATED') or s['qa_state']!='PASS' or s['approval_state'] in ('REQUIRED','REJECTED'): raise AssemblyError('scene QA/approval gate failed')
+   if s['approval_state']=='APPROVED' and not self.db.one("select 1 from approvals where project_id=? and scene_id=? and gate='SCENE' and decision='APPROVED' and revoked_at is null and project_version=? and evidence_sha256=?",(pid,s['id'],version,self._scene_evidence_hash(s['id']))): raise AssemblyError('stale scene approval evidence')
+   rows=self.db.all("select * from artifacts where scene_id=? and status='ACTIVE' and kind in ('ANIMATION','SCENE_VIDEO','IMAGE') order by version desc,id",(s['id'],))
+   videos=[a for a in rows if a['kind'] in ('ANIMATION','SCENE_VIDEO')]; pool=videos or [a for a in rows if a['kind']=='IMAGE']
+   if not pool: raise AssemblyError('exactly one eligible current scene artifact required')
+   highest=max(a['version'] for a in pool); winners=[a for a in pool if a['version']==highest]
+   if len(winners)!=1: raise AssemblyError('duplicate highest-version scene artifact')
+   a=winners[0]; path=self._owned_path(pid,a['uri']); frames=round(s['end_ms']*30/1000)-round(s['start_ms']*30/1000)
+   if frames < 1: raise AssemblyError('scene rounds to zero frames')
+   if self._hash(path)[0]!=a['sha256']: raise AssemblyError('scene artifact checksum mismatch')
+   selected.append((s,a,path,a['kind']=='IMAGE',frames))
+  if sum(x[4] for x in selected)!=frame_total: raise AssemblyError('frame allocation mismatch')
+  engine=assembler or LocalFinalAssembler(root); current_evidence=self._manifest_hash(pid)
+  manifest={'project_id':pid,'project_version':version,'current_evidence_sha256':current_evidence,'requested_output':str(out),'audio':{'sha256':ah,'duration_ms':audio['duration_ms']},'scenes':[{'scene_id':s['id'],'ord':s['ord'],'source_artifact_id':a['id'],'source_kind':a['kind'],'source_version':a['version'],'parent_id':a['parent_id'],'sha256':a['sha256'],'frames':frames} for s,a,_,_,frames in selected],'output_config':{'width':1920,'height':1080,'fps':30,'video_codec':'h264','pixel_format':'yuv420p','audio_codec':'aac','tolerance_seconds':1/30+.020},'tool_versions':None if dry_run else engine.tool_versions()}
+  evidence=hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',',':')).encode()).hexdigest(); manifest['evidence_sha256']=evidence
+  old=self.db.one("select a.*,f.manifest_json from artifacts a join final_assemblies f on f.artifact_id=a.id where f.evidence_sha256=? and a.status='ACTIVE'",(evidence,))
+  if old and Path(old['uri']).resolve()==out and self._hash(self._owned_path(pid,old['uri']))[0]==old['sha256']: return {'artifact_id':old['id'],'output':old['uri'],'reused':True,'manifest':json.loads(old['manifest_json'])}
+  if out.exists(): raise AssemblyError('output already exists')
+  commands=[engine.normalize_command(path,root/f'.segment-{i}.mp4',frames/30,image,frames=frames) for i,(s,a,path,image,frames) in enumerate(selected)]; commands += [engine.concat_command(root/'.concat.txt',root/'.visual.mp4'),engine.mux_command(root/'.visual.mp4',ap,root/'.final.tmp.mp4')]; manifest['commands']=commands
+  if dry_run:return {'dry_run':True,'output':str(out),'manifest':manifest,'commands':commands}
+  work=Path(__import__('tempfile').mkdtemp(prefix='.assembly-',dir=root))
+  try:
+   # Snapshot validated bytes first; all ffmpeg inputs below are private immutable names.
+   snap_audio=work/'audio.input'; shutil.copyfile(ap,snap_audio)
+   if self._hash(snap_audio)[0]!=ah: raise AssemblyError('audio changed while snapshotting')
+   seg=[]
+   for i,(s,a,path,image,frames) in enumerate(selected):
+    source=work/f'source-{i:06}{path.suffix}'; shutil.copyfile(path,source)
+    if self._hash(source)[0]!=a['sha256']: raise AssemblyError('scene source changed while snapshotting')
+    q=work/f'{i:06}.mp4'; engine.run(engine.normalize_command(source,q,frames/30,image,frames=frames)); seg.append(q)
+   listing=work/'concat.txt'; listing.write_text(''.join("file '{}'\n".format(str(p).replace("'", "'\\''")) for p in seg)); visual=work/'visual.mp4'; engine.run(engine.concat_command(listing,visual)); staged=work/'final.mp4'; engine.run(engine.mux_command(visual,snap_audio,staged)); manifest['ffprobe']=engine.validate_final(staged,audio['duration_ms']/1000)
+   token=uuid.uuid4().hex; pubdir=root/'.publications'; pubdir.mkdir(exist_ok=True); durable=pubdir/(token+'.staged.mp4')
+   os.replace(staged,durable); digest,size=self._hash(durable); created=now()
+   with self.db.transaction():
+    current=self.db.one('select version,state from projects where id=?',(pid,))
+    if not current or current['version']!=version or current['state']!='ACTIVE' or self._manifest_hash(pid)!=current_evidence: raise AssemblyError('project/evidence changed during assembly')
+    if out.exists() or self.db.one('select 1 from publication_journal where final_path=?',(str(out),)): raise AssemblyError('output already exists')
+    self.db.execute("insert into publication_journal values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(token,pid,version,evidence,current_evidence,str(durable),str(out),digest,size,json.dumps(manifest,sort_keys=True),'PREPARED',None,created,created,None))
+   self._publication_crash('after_prepared_commit')
+   try: self.reconcile_publications()
+   except Exception as exc:
+    # Keep the journal recoverable while restoring the promise that a failed
+    # synchronous call does not leave its requested destination exposed.
+    try:
+     if out.is_file() and not out.is_symlink() and not durable.exists(): rename_noreplace(out,durable)
+    except OSError as cleanup:
+     with self.db.transaction():
+      self.db.execute("update publication_journal set state='MANUAL_REVIEW',updated_at=?,error=? where token=? and state='PREPARED'",(now(),'REGISTRATION_FAILED; rollback rename failed: '+str(cleanup),token)); self._event(pid,'FINAL_PUBLICATION_MANUAL_REVIEW',{'token':token,'reason':str(cleanup)})
+    raise
+   row=self.db.one('select state,artifact_id,error from publication_journal where token=?',(token,))
+   if row['state']!='COMMITTED': raise AssemblyError('publication failed: '+(row['error'] or row['state']))
+   self._publication_crash('after_registration_before_cleanup')
+   final=self.db.one('select uri from artifacts where id=?',(row['artifact_id'],)); return {'artifact_id':row['artifact_id'],'output':final['uri'],'reused':False,'manifest':manifest}
+  finally: shutil.rmtree(work,ignore_errors=True)
+ def _publication_crash(self,point): pass
+ def reconcile_publications(self,_lease_token=None):
+  """Recover PREPARED publications under the process-wide SQLite lease."""
+  from .media import AssemblyError
+  owned=_lease_token is None; lease=_lease_token or self.db.acquire_reconciliation_lease()
+  try:
+   for row in self.db.all("select * from publication_journal where state='PREPARED' order by created_at,token"):
+    self.db.renew_reconciliation_lease(lease); r=dict(row); pid=r['project_id']; staging=self._owned_path(pid,r['staging_path'],False); final=self._owned_path(pid,r['final_path'],False)
+    current=self.db.one('select version,state from projects where id=?',(pid,)); valid=bool(current and current['version']==r['project_version'] and current['state']=='ACTIVE' and self._manifest_hash(pid)==r['current_evidence_sha256'])
+    sf=staging.is_file() and not staging.is_symlink(); ff=final.is_file() and not final.is_symlink(); source=final if ff else staging if sf else None
+    matching=source is not None and self._hash(source)==(r['output_sha256'],r['output_size'])
+    if not valid or not matching or (sf and ff):
+     reason='STALE_EVIDENCE' if not valid else 'MISSING_OR_TAMPERED_BYTES'; cleanup_error=None
+     if not valid and matching and source==final:
+      quarantine=final.with_name(final.name+'.aborted-'+r['token'])
+      try:
+       if quarantine.exists(): raise FileExistsError(str(quarantine))
+       with self.db.transaction(): self.db.assert_reconciliation_lease(lease); final.replace(quarantine)
+      except OSError as exc: cleanup_error=str(exc)
+     state='MANUAL_REVIEW' if cleanup_error or (source is not None and not matching) else 'ABORTED'; error=reason+((': '+cleanup_error) if cleanup_error else '')
+     with self.db.transaction():
+      self.db.assert_reconciliation_lease(lease); self.db.execute("update publication_journal set state=?,updated_at=?,error=? where token=? and state='PREPARED'",(state,now(),error,r['token'])); self._event(pid,'FINAL_PUBLICATION_'+state,{'token':r['token'],'reason':error})
+     continue
+    if not ff:
+     final.parent.mkdir(parents=True,exist_ok=True)
+     try:
+      with self.db.transaction(): self.db.assert_reconciliation_lease(lease); rename_noreplace(staging,final)
+     except FileExistsError as exc:
+      error='DESTINATION_COLLISION: atomic no-replace promotion refused: '+str(exc)
+      with self.db.transaction():
+       self.db.assert_reconciliation_lease(lease); self.db.execute("update publication_journal set state='ABORTED',updated_at=?,error=? where token=? and state='PREPARED'",(now(),error,r['token'])); self._event(pid,'FINAL_PUBLICATION_ABORTED',{'token':r['token'],'reason':error})
+      continue
+     except OSError as exc:
+      error='ATOMIC_PROMOTION_UNAVAILABLE: '+str(exc)
+      with self.db.transaction():
+       self.db.assert_reconciliation_lease(lease); self.db.execute("update publication_journal set state='MANUAL_REVIEW',updated_at=?,error=? where token=? and state='PREPARED'",(now(),error,r['token'])); self._event(pid,'FINAL_PUBLICATION_MANUAL_REVIEW',{'token':r['token'],'reason':error})
+      continue
+     self._publication_crash('after_rename_before_registration')
+    with self.db.transaction():
+     self.db.assert_reconciliation_lease(lease); current=self.db.one('select version,state from projects where id=?',(pid,))
+     if not current or current['version']!=r['project_version'] or current['state']!='ACTIVE' or self._manifest_hash(pid)!=r['current_evidence_sha256']: raise AssemblyError('project/evidence changed during publication')
+     self.db.execute("update artifacts set status='SUPERSEDED' where project_id=? and kind='FINAL_VIDEO' and status='ACTIVE'",(pid,))
+     version=self.db.one("select coalesce(max(version),0)+1 v from artifacts where project_id=? and kind='FINAL_VIDEO' and scene_id is null",(pid,))['v']; days=self.db.one('select retention_days from projects where id=?',(pid,))['retention_days']; expires=(datetime.now(timezone.utc)+timedelta(days=days)).isoformat()
+     aid=self.db.execute("insert into artifacts(project_id,scene_id,kind,uri,sha256,version,parent_id,status,created_at,expires_at) values(?,NULL,'FINAL_VIDEO',?,?,?,NULL,'ACTIVE',?,?)",(pid,str(final),r['output_sha256'],version,now(),expires)).lastrowid
+     self._event(pid,'ARTIFACT_ADDED',{'artifact':aid,'kind':'FINAL_VIDEO'})
+     self.db.execute('insert into final_assemblies values(?,?,?,?,?,?)',(aid,pid,r['project_version'],r['evidence_sha256'],r['manifest_json'],now())); self.db.execute("update publication_journal set state='COMMITTED',artifact_id=?,updated_at=?,error=NULL where token=? and state='PREPARED'",(aid,now(),r['token'])); self._event(pid,'FINAL_ASSEMBLED',{'artifact':aid,'evidence_sha256':r['evidence_sha256'],'publication_token':r['token']})
+   return [dict(x) for x in self.db.all('select * from publication_journal order by created_at,token')]
+  finally:
+   if owned:self.db.release_reconciliation_lease(lease)
  def import_srt(self,pid,cues,role=Role.OPERATOR):
   self._role(role,'import'); self._active(pid)
   rows=list(cues)

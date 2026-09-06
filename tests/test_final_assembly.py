@@ -1,0 +1,116 @@
+import hashlib, json, shutil, subprocess
+from pathlib import Path
+import pytest
+import du_pipeline.service as service_module
+from du_pipeline.db import Database
+from du_pipeline.service import Pipeline, now
+from du_pipeline.media import AssemblyError, LocalFinalAssembler
+
+
+def sha(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+def fixture(tmp_path):
+    db=Database(tmp_path/'p.db'); p=Pipeline(db); pid=p.init_project('x',scene_range=(1,3)); root=p._root(pid)
+    audio=root/'narration.wav'; audio.write_bytes(b'audio'); p.import_audio(pid,str(audio),2000,sha(audio))
+    db.execute("insert into scenes(project_id,code,ord,start_ms,end_ms,text,special,state,approval_state,qa_state,qa_json) values(?,?,?,?,?,?,?,?,?,?,?)",(pid,'S001',1,0,2000,'x',0,'ANIMATED','APPROVED','PASS','{}'))
+    sid=db.one('select id from scenes')['id']; clip=root/'clip.mp4'; clip.write_bytes(b'clip'); aid=p.add_artifact(pid,'SCENE_VIDEO',clip,sid)
+    evidence=p._scene_evidence_hash(sid); version=db.one('select version from projects')['version']
+    db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,?,?,?,?,?,?,?)",(pid,sid,'SCENE','APPROVED','t',now(),version,evidence))
+    return db,p,pid,root,sid,aid,audio
+
+def test_command_has_audio_and_no_shortest(tmp_path):
+    a=LocalFinalAssembler(tmp_path)
+    cmd=a.mux_command(tmp_path/'v.mp4',tmp_path/'a.wav',tmp_path/'o.mp4')
+    assert '-map' in cmd and '1:a:0' in cmd and '-c:a' in cmd and 'aac' in cmd and '-shortest' not in cmd
+
+def test_dry_run_order_and_no_artifact(tmp_path):
+    db,p,pid,root,sid,aid,audio=fixture(tmp_path)
+    result=p.assemble(pid,root/'final.mp4',dry_run=True)
+    assert result['manifest']['scenes'][0]['source_artifact_id']==aid
+    assert not db.one("select 1 from artifacts where kind='FINAL_VIDEO'")
+
+def test_missing_duplicate_and_tamper_fail_closed(tmp_path):
+    db,p,pid,root,sid,aid,audio=fixture(tmp_path)
+    db.execute("update scenes set approval_state='NOT_REQUIRED' where id=?",(sid,))
+    db.execute("update artifacts set status='SUPERSEDED' where id=?",(aid,))
+    with pytest.raises(AssemblyError,match='exactly one'): p.assemble(pid,root/'f.mp4',dry_run=True)
+    db.execute("update artifacts set status='ACTIVE' where id=?",(aid,)); other=root/'other.mp4'; other.write_bytes(b'x'); p.add_artifact(pid,'ANIMATION',other,sid)
+    with pytest.raises(AssemblyError,match='duplicate'): p.assemble(pid,root/'f.mp4',dry_run=True)
+    db.execute("update artifacts set status='SUPERSEDED' where kind='ANIMATION'"); (root/'clip.mp4').write_bytes(b'tampered')
+    with pytest.raises(AssemblyError,match='checksum'): p.assemble(pid,root/'f.mp4',dry_run=True)
+
+def test_output_escape_rejected(tmp_path):
+    db,p,pid,root,*_=fixture(tmp_path)
+    with pytest.raises((AssemblyError,PermissionError)): p.assemble(pid,tmp_path/'outside.mp4',dry_run=True)
+
+media_tools=pytest.mark.skipif(not shutil.which('ffmpeg') or not shutil.which('ffprobe'),reason='ffmpeg and ffprobe binaries are required')
+
+@media_tools
+def test_real_ordered_scenes_and_narration_produce_conformant_mp4(tmp_path):
+    db=Database(tmp_path/'real.db'); p=Pipeline(db); pid=p.init_project('real',scene_range=(2,2)); root=p._root(pid)
+    audio=root/'narration.wav'; subprocess.run(['ffmpeg','-y','-f','lavfi','-i','sine=frequency=440:duration=2',str(audio)],check=True,capture_output=True); p.import_audio(pid,str(audio),2000,sha(audio))
+    image=root/'second.png'; subprocess.run(['ffmpeg','-y','-f','lavfi','-i','color=c=blue:s=64x64','-frames:v','1',str(image)],check=True,capture_output=True)
+    clip=root/'first.mp4'; subprocess.run(['ffmpeg','-y','-f','lavfi','-i','color=c=red:s=64x64:d=1','-c:v','libx264','-pix_fmt','yuv420p',str(clip)],check=True,capture_output=True)
+    version=db.one('select version from projects where id=?',(pid,))['version']; source_ids=[]
+    for code,order,start,end,path,kind in [('S001',1,0,1000,clip,'SCENE_VIDEO'),('S002',2,1000,2000,image,'IMAGE')]:
+        db.execute("insert into scenes(project_id,code,ord,start_ms,end_ms,text,special,state,approval_state,qa_state,qa_json) values(?,?,?,?,?,?,?,?,?,?,?)",(pid,code,order,start,end,code,0,'ANIMATED','APPROVED','PASS','{}'))
+        sid=db.one('select id from scenes where project_id=? and code=?',(pid,code))['id']; aid=p.add_artifact(pid,kind,path,sid); source_ids.append(aid)
+        db.execute("insert into approvals(project_id,scene_id,gate,decision,actor,created_at,project_version,evidence_sha256) values(?,?,?,?,?,?,?,?)",(pid,sid,'SCENE','APPROVED','test',now(),version,p._scene_evidence_hash(sid)))
+    output=root/'ordered-final.mp4'; result=p.assemble(pid,output)
+    probe=json.loads(subprocess.run(['ffprobe','-v','error','-show_streams','-show_format','-of','json',str(output)],check=True,capture_output=True,text=True).stdout)
+    video=next(s for s in probe['streams'] if s['codec_type']=='video'); audio_stream=next(s for s in probe['streams'] if s['codec_type']=='audio')
+    assert video['codec_name']=='h264' and audio_stream['codec_name']=='aac'
+    assert float(probe['format']['duration'])==pytest.approx(2.0,abs=.06)
+    assert [s['source_artifact_id'] for s in result['manifest']['scenes']]==source_ids
+    assert result['manifest']['tool_versions']['ffmpeg'].startswith('ffmpeg version')
+    assert result['manifest']['tool_versions']['ffprobe'].startswith('ffprobe version')
+
+class SuccessfulFakeAssembler(LocalFinalAssembler):
+    def tool_versions(self): return {'ffmpeg':'ffmpeg version test','ffprobe':'ffprobe version test'}
+    def run(self,cmd): Path(cmd[-1]).write_bytes(b'generated')
+    def validate_final(self,path,expected): return {'format':{'duration':str(expected)},'streams':[]}
+
+def test_registration_failure_removes_promoted_untracked_output(tmp_path):
+    db,p,pid,root,*_=fixture(tmp_path); output=root/'final.mp4'
+    db.execute("create trigger reject_final before insert on final_assemblies begin select raise(abort,'injected registration failure'); end")
+    with pytest.raises(Exception,match='injected registration failure'): p.assemble(pid,output,assembler=SuccessfulFakeAssembler(root))
+    assert not output.exists()
+    assert not db.one("select 1 from artifacts where kind='FINAL_VIDEO'")
+    assert not db.one('select 1 from final_assemblies')
+
+
+def test_atomic_publication_collision_never_overwrites_or_registers(tmp_path, monkeypatch):
+    db,p,pid,root,*_=fixture(tmp_path); output=root/'final.mp4'
+    real = service_module.rename_noreplace
+    def collide(source, destination):
+        Path(destination).write_bytes(b'concurrent-owner')
+        return real(source, destination)
+    monkeypatch.setattr(service_module, 'rename_noreplace', collide)
+    with pytest.raises(AssemblyError, match='DESTINATION_COLLISION'):
+        p.assemble(pid, output, assembler=SuccessfulFakeAssembler(root))
+    assert output.read_bytes() == b'concurrent-owner'
+    assert not db.one("select 1 from artifacts where kind='FINAL_VIDEO'")
+    row=db.one('select state,error,staging_path from publication_journal')
+    assert row['state']=='ABORTED' and 'atomic no-replace' in row['error']
+    assert Path(row['staging_path']).read_bytes()==b'generated'
+
+
+def test_recovery_atomic_collision_never_overwrites_or_registers(tmp_path, monkeypatch):
+    db,p,pid,root,*_=fixture(tmp_path); output=root/'recovered.mp4'
+    def crash(point):
+        if point == 'after_prepared_commit': raise RuntimeError('simulated crash')
+    p._publication_crash=crash
+    with pytest.raises(RuntimeError, match='simulated crash'):
+        p.assemble(pid, output, assembler=SuccessfulFakeAssembler(root))
+    p._publication_crash=lambda point: None
+    real = service_module.rename_noreplace
+    def collide(source, destination):
+        Path(destination).write_bytes(b'recovery-racer')
+        return real(source, destination)
+    monkeypatch.setattr(service_module, 'rename_noreplace', collide)
+    p.reconcile_publications()
+    assert output.read_bytes()==b'recovery-racer'
+    assert not db.one("select 1 from artifacts where kind='FINAL_VIDEO'")
+    row=db.one('select state,error,staging_path from publication_journal')
+    assert row['state']=='ABORTED' and 'DESTINATION_COLLISION' in row['error']
+    assert Path(row['staging_path']).read_bytes()==b'generated'

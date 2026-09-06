@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime,timezone,timedelta
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 11
 
 class SchemaVersionError(RuntimeError): pass
 class LeaseUnavailable(RuntimeError): pass
@@ -51,7 +51,7 @@ class Database:
      if statement.strip(): self.conn.execute(statement)
     self.conn.execute('PRAGMA user_version=1'); version=1
    # Explicit 1 -> 2 additive upgrade from the original schema; 2 is verified below.
-   if version not in (1,2,3,4,5,6,7,8): raise SchemaVersionError(f'unsupported schema version {version}')
+   if version not in (1,2,3,4,5,6,7,8,9,10,11): raise SchemaVersionError(f'unsupported schema version {version}')
    cols={r[1] for r in self.conn.execute('pragma table_info(projects)')}
    if version == 2 and 'artifact_root' not in cols: raise SchemaVersionError('schema version 2 does not match structure')
    additions=[('min_scenes','INTEGER NOT NULL DEFAULT 50'),('max_scenes','INTEGER NOT NULL DEFAULT 360'),('retention_days','INTEGER NOT NULL DEFAULT 3'),('output_json',"TEXT NOT NULL DEFAULT '{}'") ,('version','INTEGER NOT NULL DEFAULT 1'),('artifact_root','TEXT')]
@@ -89,6 +89,15 @@ class Database:
    # Core command effects are committed atomically with this receipt.  A bridge
    # lease may be taken over, but the stable external key cannot mutate core twice.
    self.conn.execute('CREATE TABLE IF NOT EXISTS command_receipts(idempotency_key TEXT PRIMARY KEY,request_sha256 TEXT NOT NULL,response_json TEXT NOT NULL,created_at TEXT NOT NULL)')
+   self.conn.execute('CREATE TABLE IF NOT EXISTS final_assemblies(artifact_id INTEGER PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,project_version INTEGER NOT NULL,evidence_sha256 TEXT NOT NULL UNIQUE,manifest_json TEXT NOT NULL,created_at TEXT NOT NULL)')
+   self.conn.execute("""CREATE TABLE IF NOT EXISTS publication_journal(token TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,project_version INTEGER NOT NULL,evidence_sha256 TEXT NOT NULL,current_evidence_sha256 TEXT NOT NULL,staging_path TEXT NOT NULL,final_path TEXT NOT NULL,output_sha256 TEXT NOT NULL,output_size INTEGER NOT NULL,manifest_json TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('PREPARED','COMMITTED','ABORTED','MANUAL_REVIEW')),artifact_id INTEGER REFERENCES artifacts(id),created_at TEXT NOT NULL,updated_at TEXT NOT NULL,error TEXT,UNIQUE(final_path),UNIQUE(evidence_sha256))""")
+   self.conn.execute("CREATE INDEX IF NOT EXISTS idx_publication_state ON publication_journal(state,created_at)")
+   fks=self.conn.execute('PRAGMA foreign_key_list(final_assemblies)').fetchall()
+   if fks and any(r[6].upper()!='CASCADE' for r in fks):
+    self.conn.execute('ALTER TABLE final_assemblies RENAME TO final_assemblies_legacy')
+    self.conn.execute('CREATE TABLE final_assemblies(artifact_id INTEGER PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,project_version INTEGER NOT NULL,evidence_sha256 TEXT NOT NULL UNIQUE,manifest_json TEXT NOT NULL,created_at TEXT NOT NULL)')
+    self.conn.execute('INSERT INTO final_assemblies SELECT * FROM final_assemblies_legacy')
+    self.conn.execute('DROP TABLE final_assemblies_legacy')
    acols={r[1] for r in self.conn.execute('pragma table_info(approvals)')}
    for name,ddl in [('project_version','INTEGER'),('evidence_sha256','TEXT'),('revoked_at','TEXT'),('revoked_reason','TEXT')]:
     if name not in acols:self.conn.execute(f'ALTER TABLE approvals ADD COLUMN {name} {ddl}')

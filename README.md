@@ -60,3 +60,13 @@ external evidence.  If the effect happened, record/return an appropriate final
 response; if it demonstrably did not, submit the command under a **new** Discord
 message ID (and retain the blocked row for audit).  Do not reset a blocked row to
 `PROCESSING` unless the side-effect history has been conclusively reconciled.
+# Final assembly
+
+`du-pipeline --db pipeline.db assemble PROJECT_ID --output /managed/project/root/final.mp4 [--dry-run]`
+
+Assembly fails closed on stale or incomplete scene evidence, verifies managed input
+checksums, renders IMAGE artifacts explicitly, normalizes each DB-ordered scene to
+1920x1080 H.264/yuv420p at 30 fps, then muxes narration as AAC. Promotion and the
+`FINAL_VIDEO` row occur only after ffprobe verifies both streams. The duration policy
+allows one video frame plus 20 ms for AAC/container timestamp rounding; `-shortest`
+is never used. Matching verified evidence is reused on rerun.
