@@ -4,3 +4,9 @@ __pycache__/
 .venv/
 *.db
 artifacts/
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+*.egg-info/
+build/
+dist/
