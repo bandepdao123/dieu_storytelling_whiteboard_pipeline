@@ -1,0 +1,13 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {buildAgentPrompt,nextAgentStep} from '../src/agentPrompt.ts';
+const base=()=>({project:{id:'p-123',name:'Câu chuyện',version:7,state:'ACTIVE'},script:'PRIVATE SCRIPT NEVER COPY',audio:null,scenes:[],artifacts:[],next_actions:['pause','checkpoint'],gates:{pilot:{current:false}}});
+test('paused takes priority over missing inputs',()=>{const d=base();d.project.state='PAUSED';d.script=null;assert.match(nextAgentStep(d),/không tự resume/);});
+test('blocked takes priority',()=>{const d=base();d.project.state='BLOCKED';assert.match(nextAgentStep(d),/không tự đổi trạng thái/);});
+test('empty script first',()=>{const d=base();d.script='  ';assert.match(nextAgentStep(d),/cung cấp TXT/);});
+test('uploaded script missing audio asks WAV not paid TTS',()=>assert.match(nextAgentStep(base()),/cung cấp PCM WAV/));
+test('audio without plan checks cues without inventing absence',()=>{const d=base();d.audio={duration_ms:12000};assert.match(nextAgentStep(d),/kiểm tra phụ đề\/cue thực tế/);assert.match(buildAgentPrompt(d),/chưa xác nhận có hay thiếu/);});
+test('plan action grounds cue presence and local planning',()=>{const d=base();d.audio={duration_ms:12000};d.next_actions.push('plan');assert.match(nextAgentStep(d),/lập kế hoạch cảnh cục bộ/);assert.match(buildAgentPrompt(d),/ít nhất một cue/);});
+test('existing scenes never automatically replanned',()=>{const d=base();d.audio={duration_ms:12000};d.next_actions.push('plan');d.scenes.push({qa_state:'FAILED',approval_state:'REQUIRED'});assert.match(nextAgentStep(d),/không tự plan lại/);assert.match(buildAgentPrompt(d),/QA: FAILED: 1/);});
+test('completed is read only',()=>{const d=base();d.project.state='COMPLETED';assert.match(nextAgentStep(d),/không tự mở lại/);});
+test('self-contained locator and safeguards exclude script and extra credentials',()=>{const d=base();d.csrf='SECRET_CSRF';const text=buildAgentPrompt(d);for(const fact of ['p-123','Câu chuyện','7','/var/lib/audiobooks-studio','/opt/audiobooks-studio/app','đọc lại dự án thật','evidence, approvals','không bypass'])assert.ok(text.includes(fact));assert.ok(!text.includes(d.script));assert.ok(!text.includes(d.csrf));});
