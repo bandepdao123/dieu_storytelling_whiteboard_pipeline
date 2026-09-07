@@ -1,5 +1,10 @@
 # Phase 1 live integrations
 
+> Historical integration instructions/adapter contract. No live SDK/gateway or
+> delivery authorization acceptance is implied. Current CLI dry-runs require a
+> strict offline inspection DB (cli-inspection.md); missing DBs no longer initialize.
+> Discord scene replacement fails closed inside the idempotent transaction wrapper.
+
 All adapters are SDK-neutral and accept injected clients, so tests and local dry runs never
 make network calls. SQLite remains the source of truth. No token content is read by validation
 and row payloads are never logged.

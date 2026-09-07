@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime,timezone,timedelta
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 15
 
 class SchemaVersionError(RuntimeError): pass
 class LeaseUnavailable(RuntimeError): pass
@@ -51,7 +51,7 @@ class Database:
      if statement.strip(): self.conn.execute(statement)
     self.conn.execute('PRAGMA user_version=1'); version=1
    # Explicit 1 -> 2 additive upgrade from the original schema; 2 is verified below.
-   if version not in (1,2,3,4,5,6,7,8,9,10,11,12): raise SchemaVersionError(f'unsupported schema version {version}')
+   if version not in range(1,SCHEMA_VERSION+1): raise SchemaVersionError(f'unsupported schema version {version}')
    cols={r[1] for r in self.conn.execute('pragma table_info(projects)')}
    if version == 2 and 'artifact_root' not in cols: raise SchemaVersionError('schema version 2 does not match structure')
    additions=[('min_scenes','INTEGER NOT NULL DEFAULT 50'),('max_scenes','INTEGER NOT NULL DEFAULT 360'),('retention_days','INTEGER NOT NULL DEFAULT 3'),('output_json',"TEXT NOT NULL DEFAULT '{}'") ,('version','INTEGER NOT NULL DEFAULT 1'),('artifact_root','TEXT')]
@@ -138,29 +138,123 @@ class Database:
    for name,table,condition,message in ownership:
     for operation in ('INSERT','UPDATE'):
      self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS {name}_{operation.lower()} BEFORE {operation} ON {table} WHEN {condition} BEGIN SELECT RAISE(ABORT,'{message}'); END")
+   # v13: prepublication ownership is durable before bytes leave assembly work.
+   # The legacy journal stays byte-for-byte compatible (including positional INSERTs).
+   self.conn.execute("CREATE TABLE IF NOT EXISTS publication_intents(token TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),source_path TEXT NOT NULL,identity_json TEXT NOT NULL,journal_json TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('INTENT','PREPARED','ABORTED','MANUAL_REVIEW')),created_at TEXT NOT NULL,updated_at TEXT NOT NULL,error TEXT)")
+   self.conn.execute('CREATE INDEX IF NOT EXISTS idx_publication_intent_state ON publication_intents(state,created_at)')
+   # v14 is additive: preserve artifact table/FKs, IDs, bytes and history.
+   # SQLite TEXT length ignores trailing NUL; check byte length as well.
+   artifact_cols={r[1] for r in self.conn.execute('PRAGMA table_info(artifacts)')}
+   if 'detached_scene_id' not in artifact_cols:self.conn.execute('ALTER TABLE artifacts ADD COLUMN detached_scene_id INTEGER')
+   invalid_hash="typeof(sha256)!='text' OR length(sha256)!=64 OR length(CAST(sha256 AS BLOB))!=64 OR sha256 GLOB '*[^0-9a-fA-F]*'"
+   bad=self.conn.execute(f'SELECT id FROM artifacts WHERE {invalid_hash} ORDER BY id LIMIT 10').fetchall()
+   if bad: raise SchemaVersionError(f'artifact checksum preflight: ids {[r[0] for r in bad]}; manual review/explicit repair on a backed-up copy required; no rows changed')
+   invalid_identity="typeof(version)!='integer' OR version<1 OR typeof(kind)!='text' OR length(trim(kind))=0"
+   bad=self.conn.execute(f'SELECT id FROM artifacts WHERE {invalid_identity} ORDER BY id LIMIT 10').fetchall()
+   if bad: raise SchemaVersionError(f'artifact identity preflight: ids {[r[0] for r in bad]}; manual review/explicit repair on a backed-up copy required; no rows changed')
+   bad=self.conn.execute('SELECT a.id FROM artifacts a WHERE NOT EXISTS(SELECT 1 FROM projects p WHERE p.id=a.project_id) OR (a.scene_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM scenes s WHERE s.id=a.scene_id AND s.project_id=a.project_id)) OR (a.parent_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM artifacts p WHERE p.id=a.parent_id AND p.project_id=a.project_id)) ORDER BY a.id LIMIT 10').fetchall()
+   if bad: raise SchemaVersionError(f'artifact ownership preflight: ids {[r[0] for r in bad]}; manual review/explicit repair on a backed-up copy required; no rows changed')
+   duplicate=self.conn.execute('SELECT project_id,kind,version,group_concat(id) FROM artifacts WHERE scene_id IS NULL AND detached_scene_id IS NULL GROUP BY project_id,kind,version HAVING count(*)>1 LIMIT 10').fetchall()
+   if duplicate: raise SchemaVersionError(f'artifact identity preflight: duplicate ids {[r[3] for r in duplicate]}; manual review/explicit repair on a backed-up copy required; no rows changed')
+   self.conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_project_identity ON artifacts(project_id,kind,version) WHERE scene_id IS NULL AND detached_scene_id IS NULL')
+   self.conn.execute("CREATE TRIGGER IF NOT EXISTS artifact_detached_insert BEFORE INSERT ON artifacts WHEN NEW.detached_scene_id IS NOT NULL BEGIN SELECT RAISE(ABORT,'detached provenance is only recorded during scene detachment'); END")
+   self.conn.execute("CREATE TRIGGER IF NOT EXISTS artifact_detached_update BEFORE UPDATE ON artifacts WHEN NOT (NEW.detached_scene_id IS OLD.detached_scene_id OR (OLD.detached_scene_id IS NULL AND OLD.scene_id IS NOT NULL AND NEW.scene_id IS NULL AND NEW.detached_scene_id IS OLD.scene_id)) OR (NEW.detached_scene_id IS NOT NULL AND NEW.scene_id IS NOT NULL) BEGIN SELECT RAISE(ABORT,'invalid detached artifact provenance'); END")
+   for operation in ('INSERT','UPDATE'):
+    identity_condition=invalid_identity.replace('version','NEW.version').replace('kind','NEW.kind')
+    self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS artifact_identity_{operation.lower()} BEFORE {operation} ON artifacts WHEN {identity_condition} BEGIN SELECT RAISE(ABORT,'artifact identity requires positive integer version and nonempty kind'); END")
+    condition=invalid_hash.replace('sha256','NEW.sha256')
+    self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS artifact_checksum_{operation.lower()} BEFORE {operation} ON artifacts WHEN {condition} BEGIN SELECT RAISE(ABORT,'artifact sha256 must be 64 hexadecimal characters'); END")
+   # v15: bounded command-copy claim; legacy success receipts stay unchanged.
+   self.conn.execute("CREATE TABLE IF NOT EXISTS command_copy_requests(idempotency_key TEXT PRIMARY KEY,request_sha256 TEXT NOT NULL,attempt TEXT NOT NULL,lease_expires_at TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('PREPARING','SUCCEEDED','MANUAL_REVIEW')),expected_json TEXT NOT NULL,preparation_json TEXT,error TEXT,created_at TEXT NOT NULL)")
    self.conn.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
    if self.conn.execute('PRAGMA integrity_check').fetchone()[0]!='ok': raise sqlite3.DatabaseError('integrity check failed')
    if self.conn.execute('PRAGMA foreign_key_check').fetchone(): raise sqlite3.IntegrityError('foreign key check failed')
    self.conn.commit()
-  except Exception:
-   self.conn.rollback(); self.conn.close(); self.conn=None; raise
+  except BaseException as exc:
+   # Cancellation must release the migration writer even with retained tracebacks.
+   self._rollback_or_close(exc)
+   try:self.close()
+   except BaseException as cleanup:exc.add_note(f'migration close failed: {cleanup!r}')
+   raise
+ @classmethod
+ def open_existing(cls,path,*,readonly=False,operational_wal=False):
+  """Open a current database without initialization, migration or journal changes.
+
+  Strict inspection supports rollback-journal databases only. SQLite's standard
+  WAL reader can create/mutate shared-memory sidecars even in mode=ro; never use
+  immutable=1 to hide a live WAL. Inspect an operator-prepared offline backup
+  instead, or explicitly opt into operational_wal=True, which permits SQLite
+  WAL/SHM sidecar creation/shared-memory writes (not zero filesystem mutation).
+  Neither mode checkpoints or converts journal mode. The legacy constructor
+  remains the explicit writable migration API.
+  """
+  path=Path(path).absolute()
+  if not path.is_file(): raise FileNotFoundError('database unavailable')
+  if readonly and not operational_wal:
+   with path.open('rb') as stream: header=stream.read(100)
+   if len(header)>=20 and header[18:20]==b'\x02\x02':
+    raise SchemaVersionError('strict inspection requires an offline rollback-journal backup; live WAL inspection unsupported')
+  self=cls.__new__(cls); self.path=path; self._tx_depth=0; self.readonly=readonly; self.conn=None
+  try:
+   self.conn=sqlite3.connect(path.as_uri()+('?mode=ro' if readonly else '?mode=rw'),uri=True)
+   self.conn.row_factory=sqlite3.Row
+   if self.conn.execute('PRAGMA user_version').fetchone()[0]!=SCHEMA_VERSION:
+    raise SchemaVersionError('current schema required; run explicit migration on a backed-up writable database')
+   self.conn.execute('PRAGMA foreign_keys=ON')
+   if readonly:self.conn.execute('PRAGMA query_only=ON')
+   return self
+  except BaseException:
+   self.close(); raise
  def close(self):
   if self.conn is not None:self.conn.close();self.conn=None
  def __enter__(self): return self
  def __exit__(self,*exc): self.close()
+ def _rollback_or_close(self,original):
+  try:self.conn.rollback()
+  except BaseException as cleanup:
+   original.add_note(f'transaction rollback failed; connection discarded: {cleanup!r}')
+   conn=self.conn; self.conn=None
+   try:conn.close()
+   except BaseException as close_error:original.add_note(f'connection close failed: {close_error!r}')
  @contextmanager
- def transaction(self):
-  outer=self._tx_depth==0
-  if outer:self.conn.execute('BEGIN IMMEDIATE')
-  self._tx_depth+=1
+ def transaction(self,*,write=True):
+  """Write transaction (or deferred read snapshot); nested failures isolate.
+
+  A connection belongs to one thread. Transaction control must go through this
+  context manager, not manual COMMIT/ROLLBACK inside a managed scope.
+  write=False avoids reserving the writer for polling SELECTs; it is not an
+  SQL authorization sandbox. Nested scopes retain the caller's snapshot.
+  """
+  if write and getattr(self,'readonly',False): raise PermissionError('inspection cannot acquire a writer')
+  depth=self._tx_depth; outer=depth==0
+  if self.conn is None:raise sqlite3.DatabaseError('connection unavailable after cleanup failure')
+  if getattr(self,'_tx_poison',None) is not None:raise sqlite3.DatabaseError('transaction rollback-only: nested isolation lost') from self._tx_poison
+  savepoint='du_tx_'+uuid.uuid4().hex if not outer else None
+  if outer:self.conn.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
+  else:self.conn.execute(f'SAVEPOINT {savepoint}')
+  self._tx_depth=depth+1
   try:
    yield self
-   self._tx_depth-=1
+   if getattr(self,'_tx_poison',None) is not None:raise sqlite3.DatabaseError('transaction rollback-only: nested isolation lost') from self._tx_poison
    if outer:self.conn.commit()
-  except Exception:
-   self._tx_depth-=1
-   if outer:self.conn.rollback()
+   else:self.conn.execute(f'RELEASE SAVEPOINT {savepoint}')
+  except BaseException as exc:
+   if outer:
+    if self.conn is not None:self._rollback_or_close(exc)
+   elif getattr(self,'_tx_poison',None) is None:
+    try:
+     self.conn.execute(f'ROLLBACK TO SAVEPOINT {savepoint}')
+     self.conn.execute(f'RELEASE SAVEPOINT {savepoint}')
+    except BaseException as cleanup:
+     # Keep every enclosing scope rollback-only even if its caller catches exc.
+     # Do not issue a full rollback here: subsequent direct SQL must remain in
+     # the outer transaction rather than accidentally starting a new one.
+     self._tx_poison=cleanup
+     exc.add_note(f'nested isolation lost; outer transaction rollback-only: {cleanup!r}')
    raise
+  finally:
+   self._tx_depth=depth
+   if outer:self._tx_poison=None
  def execute(self,sql,args=()):
   cur=self.conn.execute(sql,args)
   if not self._tx_depth:self.conn.commit()

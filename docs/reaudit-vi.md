@@ -1,5 +1,9 @@
 # Phản hồi Operational Re-audit — baseline d7ab6545
 
+> Historical response at the named baseline, not current production acceptance.
+> Preserve evidence below; current limitations are in capabilities.md and the
+> 2026-09-06 Phase2 plan, including subsequent independently reproduced blockers.
+
 ## Phạm vi xác minh
 
 - Tài liệu nguồn: `Dieu_Storytelling_Whiteboard_Pipeline_Operational_Reaudit_d7ab6545.pdf`.

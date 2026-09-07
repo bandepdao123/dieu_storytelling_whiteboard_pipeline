@@ -113,7 +113,7 @@ def test_reconciliation_closes_parent_fds_across_rows_and_branches(tmp_path):
     for i in range(80):
         token=f'leak-{i}'; final=root/'nested'/str(i)/'final.mp4'
         db.execute("insert into publication_journal values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-          (token,pid,db.one('select version from projects where id=?',(pid,))['version'],f'e-{i}',p._manifest_hash(pid),str(root/'.publications'/f'{token}.mp4'),str(final),'0'*64,1,'{}','PREPARED',None,now(),now(),None))
+          (token,pid,db.one('select version from projects where id=?',(pid,))['version'],__import__('hashlib').sha256(f'e-{i}'.encode()).hexdigest(),p._manifest_hash(pid),str(root/'.publications'/f'{token}.mp4'),str(final),'0'*64,1,'{}','PREPARED',None,now(),now(),None))
     p.reconcile_publications()
     assert len(os.listdir('/proc/self/fd')) <= before + 2
     assert db.one("select count(*) n from publication_journal where state='ABORTED'")['n']==80

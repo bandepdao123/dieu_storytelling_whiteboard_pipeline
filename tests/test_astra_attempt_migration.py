@@ -1,7 +1,7 @@
 """Historical attempts DDL (v1-v11), not relabelled modern attempts."""
 import sqlite3
 import pytest
-from du_pipeline.db import Database, SCHEMA
+from du_pipeline.db import Database, SCHEMA, SCHEMA_VERSION
 
 LEGACY_ATTEMPTS="""CREATE TABLE attempts(id INTEGER PRIMARY KEY,scene_id INTEGER NOT NULL REFERENCES scenes(id) ON DELETE CASCADE,number INTEGER NOT NULL CHECK(number BETWEEN 1 AND 3),provider TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('RUNNING','SUCCEEDED','FAILED')),error TEXT,failed_path TEXT,failed_sha256 TEXT,failed_size INTEGER,created_at TEXT NOT NULL,UNIQUE(scene_id,number))"""
 
@@ -35,7 +35,7 @@ def test_migration_failure_rolls_back_historical_table(tmp_path,monkeypatch):
     original=sqlite3.connect
     class Failure(sqlite3.Connection):
         def execute(self,sql,*args,**kwargs):
-            if sql.startswith('PRAGMA user_version=12'):
+            if sql.startswith(f'PRAGMA user_version={SCHEMA_VERSION}'):
                 raise sqlite3.OperationalError('injected migration failure')
             return super().execute(sql,*args,**kwargs)
     monkeypatch.setattr(sqlite3,'connect',lambda *a,**kw:original(*a,factory=Failure,**kw))

@@ -14,7 +14,7 @@ def test_duration_semantic_exceptions(tmp_path,duration,exception):
  if exception: assert json.loads(s[0]['duration_exception'])['reason']=='unavoidable_semantic_unit'
 
 def test_duration_crosses_180_seconds(tmp_path):
- p,pid=pipe(tmp_path,185000,(175000,185000,'cross')); scenes=p.plan_scenes(pid)
+ p,pid=pipe(tmp_path,185000,(0,185000,'cross')); scenes=p.plan_scenes(pid)
  assert any(x['end_ms']==180000 for x in scenes)
  assert all(not (x['start_ms']<180000<x['end_ms']) for x in scenes)
 

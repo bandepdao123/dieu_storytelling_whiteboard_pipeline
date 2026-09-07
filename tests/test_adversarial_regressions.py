@@ -76,7 +76,7 @@ def test_replace_scene_is_atomic_when_ingest_fails(app, monkeypatch):
     sid = db.one("select id from scenes where project_id=?", (pid,))[0]
     source = tmp / "one.png"; source.write_bytes(b"one")
     old = pipe.add_artifact(pid, "IMAGE", source, sid)
-    monkeypatch.setattr(pipe, "add_artifact", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ingest fault")))
+    monkeypatch.setattr(pipe, "_register_artifact", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ingest fault")))
     with pytest.raises(RuntimeError): pipe.replace_scene_artifact(sid, source)
     assert db.one("select status from artifacts where id=?", (old,))[0] == "ACTIVE"
 

@@ -1,5 +1,9 @@
 # Audit tối ưu workflow và token/chi phí AI
 
+> Historical audit: results below retain their original fixture/snapshot scope.
+> “Token = 0” means no model invocation in that code path, not measured production
+> token telemetry or savings. Current capability authority: capabilities.md.
+
 ## Executive summary
 
 Audit tại baseline `be5f499d4ff7b1a28aa456b267840d30b3e5f57d` (2026-09-06). Core là bộ điều phối SQLite/local; **không có lời gọi LLM/provider AI live**. Vì vậy token thực đo trong baseline và sau sửa là **0**; không có cơ sở để tuyên bố phần trăm tiết kiệm token hay tiền.

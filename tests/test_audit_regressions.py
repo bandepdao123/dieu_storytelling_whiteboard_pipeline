@@ -97,7 +97,7 @@ def test_superseded_expired_artifact_is_cleaned(tmp_path):
 
 
 def test_pause_and_cancel_fence_jobs(tmp_path):
-    db,p,pid=pipeline(tmp_path); jid=p._create_job(pid,'X'); p.pause(pid)
+    db,p,pid=pipeline(tmp_path); p.checkpoint(pid,'pause-control',{}); jid=p.status(pid)['jobs'][-1]['id']; p.pause(pid)
     assert db.one('select state from jobs where id=?',(jid,))['state']=='PAUSED'
     p.resume(pid); p.cancel_project(pid)
     assert db.one('select state from jobs where id=?',(jid,))['state']=='BLOCKED'
@@ -200,7 +200,7 @@ def test_expired_sheet_lease_is_reclaimed(tmp_path):
 @pytest.mark.parametrize('mutation',[
     lambda p,pid:p.select_provider(pid,'other-provider'),
     lambda p,pid:p.select_preset(pid,'presentation'),
-    lambda p,pid:p.configure_project(pid,'transition','crossfade'),
+    lambda p,pid:p.configure_project(pid,'language','en'),
 ])
 def test_generation_config_mutations_version_fence_and_enter_evidence(tmp_path,mutation):
     db,p,pid=pipeline(tmp_path); p.plan_scenes(pid); jid=p._create_job(pid,'BATCH_IMAGE')

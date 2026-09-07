@@ -1,5 +1,8 @@
 # Data Contracts v1 (frozen)
 
+> Historical frozen contract, not current schema authority. See capabilities.md,
+> cli-inspection.md and the Phase2 plan for v14/checkpoint v4 compatibility.
+
 Historical contract below; it is not a complete current runtime specification.
 
 ## 2026-09-06 canonical projection clarification (F03 only)

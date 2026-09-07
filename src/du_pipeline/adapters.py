@@ -26,6 +26,7 @@ ALIASES={
  "phe-duyet":"approve","tu-choi":"reject","pause":"pause","resume":"resume",
  "retry":"retry","status":"status"}
 def parse_discord(text):
+    if not isinstance(text,str): raise CommandError('INVALID_ARGUMENT','command text must be a string')
     try: parts=shlex.split(text.strip())
     except ValueError as exc: raise CommandError('INVALID_ARGUMENTS','malformed quoting') from exc
     if not parts or not parts[0].startswith("du-"): raise CommandError("INVALID_COMMAND","command must begin du-")

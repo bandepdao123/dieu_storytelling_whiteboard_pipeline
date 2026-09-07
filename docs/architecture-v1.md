@@ -1,5 +1,8 @@
 # Architecture v1 (frozen)
 
+> Historical frozen design. Consult capabilities.md and the Phase2 plan for
+> current implementation boundaries; this is not a production acceptance record.
+
 `du_pipeline` is a ports-and-adapters Python 3.11 package.
 
 - **Domain/policy**: enums and duration, validation, approvals, retry/RBAC policies.

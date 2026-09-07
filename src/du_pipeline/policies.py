@@ -21,6 +21,30 @@ def validate_timing(audio_ms: int, cues, tolerance_ms: int=500):
     if abs(audio_ms-cues[-1][1]) > tolerance_ms: raise TimingMismatch("SRT terminal drift")
     return True
 
+def local_visual_frames(audio_ms, intervals):
+    """Exact ms coverage, then cumulative nearest-frame rounding (ties to even)."""
+    from fractions import Fraction
+    recovery = ('; local assembly timing unsupported. Recovery: retain the original SRT/audio; '
+                'use a separately approved continuous visual-coverage plan in an external editor '
+                'with explicit gap/outro footage. This cue-based planner has no gap/outro API; '
+                'do not close silence, extend stills or rewrite subtitle text. '
+                'Retry here only with independently valid contiguous source timing.')
+    previous = 0
+    frames = []
+    if type(audio_ms) is not int or audio_ms <= 0 or not intervals:
+        raise TimingMismatch('missing/inexact integer-ms audio or visual intervals'+recovery)
+    for i,(start,end) in enumerate(intervals,1):
+        if type(start) is not int or type(end) is not int or start != previous or end <= start or end > audio_ms:
+            raise TimingMismatch(f'interval {i}: expected start {previous} ms, got {start}..{end} ms'+recovery)
+        count = round(Fraction(end*30,1000))-round(Fraction(start*30,1000))
+        if count < 1: raise TimingMismatch(f'interval {i} rounds to zero frames'+recovery)
+        frames.append(count); previous = end
+    if previous != audio_ms:
+        raise TimingMismatch(f'visual tail ends at {previous} ms, audio ends at {audio_ms} ms'+recovery)
+    if sum(frames) != round(Fraction(audio_ms*30,1000)):
+        raise TimingMismatch('frame allocation mismatch'+recovery)
+    return frames
+
 def required_approval(code: str, special: bool): return special or int(code[1:]) <= 5
 
 @dataclass(frozen=True)

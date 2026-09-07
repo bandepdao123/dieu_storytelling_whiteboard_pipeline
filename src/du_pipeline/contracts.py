@@ -51,6 +51,27 @@ class OutputConfig:
   if (self.aspect_ratio,self.codec.upper(),self.container.upper(),self.pixel_format)!=("16:9","H264","MP4","yuv420p"): raise ValueError('immutable encoding contract')
   if any((self.music,self.subtitles,self.srt,self.logo)): raise ValueError('music/subtitles/SRT/logo forbidden')
   if not 1<=self.final_hold_seconds<=2: raise ValueError('hold must be 1-2 seconds')
+  validate_local_output(self.__dict__)
+
+def validate_local_output(config, transition='hard_cut'):
+ """Validate flat OutputConfig or stored preset envelope, without rewriting it.
+
+ final_hold_seconds=1.5 is legacy metadata, NOT an implemented reveal/hold.
+ """
+ message='local output configuration unsupported. Recovery: use OutputConfig() or select_preset(project_id, "youtube") and configure_project(project_id, "transition", "hard_cut"); local assembly is fixed H264 MP4 1920x1080 30fps yuv420p/AAC hard-cut; custom hold/reveal is unsupported.'
+ if not isinstance(config,dict): raise ValueError(message)
+ if 'config' in config:
+  if set(config)-{'preset','config'} or config.get('preset') not in ('youtube','presentation'): raise ValueError(message)
+  config=config['config']
+ if not isinstance(config,dict): raise ValueError(message)
+ defaults={name:field.default for name,field in OutputConfig.__dataclass_fields__.items()}
+ if set(config)-set(defaults): raise ValueError(message)
+ for key,expected in defaults.items():
+  value=config.get(key,expected)
+  if key in ('codec','container') and isinstance(value,str): value=value.upper()
+  if value!=expected or (isinstance(expected,bool) and type(value) is not bool): raise ValueError(message+' Field: '+key)
+ if transition!='hard_cut': raise ValueError(message+' Field: project.transition')
+ return True
 class ResearchProvider(Protocol):
  def research(self,topic:str)->Mapping[str,Any]:...
 class ScriptProvider(Protocol):

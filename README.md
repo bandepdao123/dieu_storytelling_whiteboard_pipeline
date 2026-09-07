@@ -1,110 +1,148 @@
-# Dieu Storytelling Whiteboard Pipeline — Phase 1
+# Dieu Storytelling Whiteboard Pipeline
 
-Nền tảng điều phối chạy được bằng SQLite cho pipeline kể chuyện vi/en. Phase 1 quản lý metadata, kiểm tra timing, trạng thái, retry, approval, lineage và audit; **không** tạo ảnh trả phí, hoạt họa, render MP4 hay tuyên bố precision whiteboard.
+Local SQLite orchestration and real FFmpeg final assembly for storytelling media.
+This is an uncommitted Phase2 review candidate, NOT full production acceptance or
+an autonomous whiteboard generator. See [capabilities](docs/capabilities.md),
+[inspection](docs/cli-inspection.md), and [assembly contract](docs/final-assembly.md).
 
-## Yêu cầu và cài đặt chính xác
+## Local media CLI continuation
 
-```bash
-cd /home/hermes/projects/dieu_storytelling_whiteboard_pipeline
-python3.11 -m venv .venv
+See [executable real WAV/PPM CLI workflow](docs/cli-media-workflow.md) for typed
+artifact/attempt/scene-QA/POST_BATCH/final-QA/final-review commands and scene-range
+flags. QA is caller-supplied external evidence, not an invented AI evaluation.
+Strict inspection remains default; explicit --operational-wal allows SQLite
+sidecar writes without checkpoint/journal conversion. The historical omitted-CLI
+inventory below is superseded by that workflow and the capability matrix.
+
+## Installation
+
+From the repository root, Python >=3.11:
+
+```sh
+python -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
-# tests dùng pytest (dependency phát triển duy nhất)
 python -m pip install pytest
 python -m pytest -q
 ```
 
-Runtime dùng hoàn toàn Python standard library. Python >=3.11.
+Core runtime is standard-library Python. Real assembly additionally needs local
+FFmpeg/ffprobe and Linux no-replace filesystem support. Optional local DOCX/XLSX
+extraction needs python-docx/openpyxl. Network document inputs need an explicitly
+supplied adapter; the CLI does not supply one. No provider is invoked by planning.
+Default image request remains Codex OAuth, gpt-image-2, high, without fallback.
 
-## Chạy
+## Executable temporary inspection quickstart
 
-```bash
-du-pipeline --db demo.db init "Demo" --language vi --seed 42
-# lấy project_id từ JSON, rồi:
-du-pipeline --db demo.db import-audio PROJECT_ID narration.wav 60000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-du-pipeline --db demo.db import-srt PROJECT_ID narration.srt
-du-pipeline --db demo.db plan PROJECT_ID
-du-pipeline --db demo.db status PROJECT_ID
-# polling/dashboard: payload gọn, không chứa toàn bộ scene
-du-pipeline --db demo.db status-summary PROJECT_ID
-du-pipeline --db demo.db pause PROJECT_ID
-du-pipeline --db demo.db resume PROJECT_ID
-du-pipeline --db demo.db retry SCENE_DATABASE_ID
-du-pipeline --db demo.db approve PROJECT_ID S001 --actor owner
-du-pipeline --db demo.db reject PROJECT_ID S002 --actor reviewer
-du-pipeline --db demo.db report PROJECT_ID
+This example deliberately creates only a disposable metadata project and an
+OFFLINE inspection copy. It does not generate media, measure model usage, or
+pretend missing QA/approvals exist. Run in an installed environment:
+
+```sh
+python - <<'PY'
+import json, pathlib, sqlite3, subprocess, tempfile
+root = pathlib.Path(tempfile.mkdtemp(prefix='du-cli-demo-'))
+db = root / 'demo.db'
+def cli(path, *args):
+    result = subprocess.run(['du-pipeline', '--db', str(path), *args],
+                            check=True, capture_output=True, text=True)
+    return json.loads(result.stdout)
+pid = cli(db, 'init', 'Demo', '--language', 'vi')['project_id']
+copy = root / 'inspection.db'
+# Explicit backup creation is writable setup, NOT part of inspection.
+source = sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)
+target = sqlite3.connect(copy)
+try:
+    source.backup(target)
+    target.execute('PRAGMA journal_mode=DELETE')
+finally:
+    target.close()
+    source.close()
+print(cli(copy, 'status-summary', pid))
+print(cli(copy, 'report', pid))
+print(root)
+PY
 ```
 
-`import-script PROJECT_ID KIND SOURCE` nhận kind `text|docx|gdocs|excel|url` và chỉ lưu metadata chuẩn hóa ở Phase 1. SRT/audio có command riêng. Remote GDocs/URL, Excel/DOCX extraction are provider interfaces, không fetch mạng. Không đọc/lưu secret.
+The backup step may access WAL shared memory; use it only as an explicitly
+writable maintenance/setup operation, never as a claim of zero-write live polling.
+Strict inspection itself never initializes/migrates, changes journal mode, creates
+artifact directories or reserves a database writer. WAL databases are currently
+rejected, including closed WAL databases; use an offline rollback-journal backup.
+This is an explicit live-monitoring limitation, not a transparent snapshot feature.
 
-## Quy tắc chính
+## Local workflow commands and limits
 
-Audio là đồng hồ chuẩn. Cue rỗng, overlap, ngoài audio hoặc lệch điểm cuối >500ms sẽ BLOCKED, không tự căn chỉnh. S001–S005 và scene special cần duyệt. Image attempt tối đa 3; chỉ scene đó BLOCKED. Binary lỗi bị xóa ngay, metadata attempt còn; artifact thường có TTL 3 ngày. SQLite là source of truth; Sheet 11 tab và Drive folders là contract. Provider image/animation là Protocol plugin.
+`--db` and `--role OWNER|REVIEWER|OPERATOR` precede the command. This is a trusted
+local OS/DB-access boundary; choosing a role is not remote authentication.
 
-Metadata output mặc định mô tả 1920x1080, 30fps, 16:9 H.264 MP4; hard cut, không music/sub/logo, final hold 1–2s nằm trong duration. Core local đã có dispatcher `du-*` không dấu với schema/RBAC, checkpoint stage, restore latest, rerun có approval + invalidation/version, duration exception và cleanup idempotent bảo vệ dữ liệu bất biến. Render thực tế, contact-sheet image synthesis, AI-QA model invocation, cloud/Discord network adapters và ultimate precision **chưa live**, thuộc phase sau.
-# Phase 1 boundary
+- `init NAME [--language vi|en] [--seed N] [--style JSON] [--references JSON]`
+  initializes/migrates and creates a project. Default scene range is 50–360;
+  custom scene range is currently a Python API option, not a CLI flag.
+- `migrate` explicitly upgrades an existing DB. Back up first. Normal writable
+  commands require existing current schema and do not auto-migrate.
+- `import-audio PROJECT_ID URI DURATION_MS SHA256` records supplied metadata.
+  It does not copy narration, probe duration, or calculate its checksum. Put real
+  narration under the managed project root and measure its actual bytes/duration
+  externally; do not use placeholder hashes. Managed root is in project status.
+- `import-srt PROJECT_ID PATH` parses timing; `import-script PROJECT_ID KIND SOURCE`
+  normalizes text/docx/excel inputs or requires an adapter for gdocs/url. Document
+  import is not semantic scene planning or prompt generation.
+- `plan PROJECT_ID` uses audio/SRT cues and duration policy. It is not a semantic
+  script segmenter; subdivisions can repeat cue text. Identical plan replay is
+  not promised to be a no-op: replan invalidates/version-fences derived evidence.
+- `approve PROJECT_ID SCENE_CODE --actor NAME` and `reject ...` submit human
+  scene decisions. Approval requires current subject-bound QA; not an AI invocation.
+- `pause PROJECT_ID`, `resume PROJECT_ID`, `retry SCENE_DATABASE_ID` manage metadata
+  lifecycle/jobs; queued does not mean an actual production worker is running.
+- `status`, `status-summary`, `report` take PROJECT_ID. `discord-status` takes
+  MESSAGE_ID. All inspection and `--dry-run` routes use the strict open above.
+- `assemble PROJECT_ID OUTPUT_PATH [--dry-run]` (alias `assemble-final`) requires
+  managed, verified inputs and current scene/POST_BATCH evidence. OUTPUT_PATH is
+  positional, not `--output`. Real assembly normalizes images/clips and muxes audio.
+- `recover-publications` mutates recorded publication recovery state. Unknown
+  files/manual-review rows are not automatically cleaned or repaired.
 
-The repository provides a deterministic, local fake/dry-run orchestration core with
-SQLite persistence, typed QA evidence, approval gates, bounded scheduling and
-checkpoint snapshots. Google/Discord/provider network integrations and the
-precision whiteboard rendering engine are intentionally **not implemented**;
-adapters remain local contracts/fakes and no claim of production media fidelity is made.
-# Discord v7 migration safety
+There is NOT yet a pure CLI init-to-reviewed-real-MP4 workflow. Missing explicit
+CLI paths: safe measured narration ingestion, scene-range configuration, image
+result registration, scene typed QA import, POST_BATCH contact/QA review, final
+QA import/final review, checkpoint restore and rerun proposal lifecycle. These
+have public Python service paths where noted in the capability matrix; do not
+insert approvals via SQL to bypass the missing commands. Public-API real-media
+E2E tests exercise assembly without SQL approval shortcuts. No new CLI media E2E
+is claimed by the metadata quickstart.
 
-Legacy (pre-v7) Discord rows found in `PROCESSING` cannot be classified safely:
-the old schema does not prove whether the command's canonical side effect was
-committed.  Migration therefore marks them `MANUAL_REVIEW`, records
-`V7_LEGACY_PROCESSING_SIDE_EFFECT_UNKNOWN` in `error`, and clears their leases.
-The bridge will not execute or automatically retry these message IDs.
+## Safety and compatibility
 
-An operator must compare the original command with project events/state and any
-external evidence.  If the effect happened, record/return an appropriate final
-response; if it demonstrably did not, submit the command under a **new** Discord
-message ID (and retain the blocked row for audit).  Do not reset a blocked row to
-`PROCESSING` unless the side-effect history has been conclusively reconciled.
-# Final assembly
+Local output is fixed 1920×1080/30fps H.264/yuv420p MP4, AAC narration, hard cuts.
+IMAGE renders as a whole-scene still, NOT an exact pen-tip reveal. No synthesized
+hand trajectory, AI QA, contact-sheet synthesis, music/subtitle/logo generation or
+custom hold is implemented. Default hold=1.5 is legacy metadata only.
 
-`du-pipeline --db pipeline.db assemble PROJECT_ID --output /managed/project/root/final.mp4 [--dry-run]`
+SRT import tolerance is not assembly readiness. Planning requires exact continuous
+0-to-narration coverage and positive cumulative rounded 30fps scene allocation.
+Gaps/tails reject rather than stretch stills or alter narration/subtitles. See the
+assembly document for quantization, output verification and recovery details.
 
-Assembly fails closed on stale or incomplete scene evidence, verifies managed input
-checksums, renders IMAGE artifacts explicitly, normalizes each DB-ordered scene to
-1920x1080 H.264/yuv420p at 30 fps, then muxes narration as AAC. Promotion and the
-`FINAL_VIDEO` row occur only after ffprobe verifies both streams. The duration policy
-allows one video frame plus 20 ms for AAC/container timestamp rounding; `-shortest`
-is never used. Same-input reuse is intended but currently blocked by the audited
-output-alias/input-evidence defects (F06); do not rely on rerun reuse yet.
+Copy-producing artifact registration/contact review reject unsupported caller-owned
+transaction nesting. Keyed Discord scene replacement is supported through the
+durable claim/copy/finalize path, with attempt/lease fencing and atomic result.
+Expired/failed claims and unknown crash residuals require manual review, not blind
+retry or sweeping. See docs/r2-command-copy.md for exact support and limits.
 
-## Astra remediation status — partial, not production acceptance
+Schema is v15 (artifact identity/checksum preflight, detached history provenance,
+durable command-copy claims);
+invalid/ambiguous legacy rows require manual review on a backup, not normalization.
+Checkpoint snapshot v4 binds capture/plan identity. Existing scene-bearing v3 fails
+closed by default; explicit OWNER recover-legacy-content supports only matching
+canonical content revalidation as a NEW generation, not historical source recovery.
+See docs/legacy-content-recovery.md for opt-in, receipts and decision boundaries.
+Empty-scene v3 retains ordinary compatibility. Historical snapshots
+are not rewritten. Pre-v7 Discord PROCESSING becomes MANUAL_REVIEW, not automatic
+retry. See the phase2 plan for limits and historical migration fixture coverage.
 
-The 2026-09-06 remediation fixes F03's nonempty-artifact hash
-projection mismatch. Actual gates and summary now share canonical evidence
-builders. F02/F04 now separate scene-local dependency revisions from global
-execution fencing, and require IMAGE ID/hash-bound QA before human approval.
-Public-API sequential multi-scene approval and local assembly are regression-tested.
-Legacy unbound QA requires fresh QA/approval; see `docs/scene-evidence-v2.md`.
-F01 parent-symlink remediation
-now uses pinned no-follow directory traversal for cleanup, rollback and deletion
-recovery; rename is relative and atomically no-overwrite, unlink is relative,
-and regular-file identity/content are verified. F05 full scratch ownership,
-F06 reuse, F07 rerun dependencies and F08 real final review
-remain outstanding. See `docs/plans/2026-09-06-astra-remediation.md`.
-
-F05 containment added in the continuation: `record_image_attempt` retains every
-caller-supplied `failed_binary`; a managed path alone does not authorize deletion.
-Diagnostic metadata is still recorded. Dedicated scratch ownership receipts and
-journaled retirement remain pending, so failed payloads may accumulate. This does
-not complete F05 or Phase 1.
-
-F01 cleanup commits an append-only `DELETION_PREPARED` event receipt before
-renaming to `.deleting-f01-<token>`; it refuses an enclosing transaction. Recovery
-requires the receipt's inode/owner/content identity for that format. Legacy
-`.deleting-*` recovery requires exact tracked bytes. Unknown bytes, collisions,
-symlinks and mismatched receipts are retained for operator review. Lease checks
-remain inside write transactions; a lost lease leaves recoverable staging. No
-retention classes or TTL were changed. This is not protection against arbitrary
-same-UID writes between the final leaf identity check and the filesystem syscall,
-nor a power-loss durability guarantee.
-
-F15 retention decision is pending: the existing TTL treatment of `FINAL_VIDEO`
-was not changed and differs from protected legacy `FINAL`. Do not infer final
-retention/delivery safety or production readiness from passing regression tests.
+F15 retention remains unresolved: FINAL_VIDEO TTL differs from protected legacy
+FINAL. No retention, license, provider settings or delivery policy is changed.
+Historical audits/plans retain their original evidence and are not current
+acceptance statements. No measured token savings, live provider usage, full
+production readiness or hardware power-loss certification is claimed.

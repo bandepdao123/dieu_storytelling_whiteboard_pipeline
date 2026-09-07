@@ -1,5 +1,8 @@
 # Phase 1 Requirements (frozen v1)
 
+> Historical requirements, not proof every feature is implemented. Current
+> implementation and omitted usecases are listed in capabilities.md.
+
 Status: frozen 2026-09-05. Changes require a new version and approved impact proposal.
 
 ## Scope

@@ -46,7 +46,7 @@ def rename_noreplace_at(source_fd, source_name, destination_fd, destination_name
         if error == errno.EEXIST: raise FileExistsError(error, os.strerror(error), os.fspath(destination_name))
         raise OSError(error, os.strerror(error), os.fspath(destination_name))
 
-def open_dir_beneath(root, relative=Path('.'), create=False):
+def open_dir_beneath(root, relative=Path('.'), create=False, durable=False):
     """Pin a directory below root while refusing symlinks in every component."""
     relative = Path(relative)
     if relative.is_absolute() or '..' in relative.parts: raise PermissionError('path escapes managed artifact root')
@@ -70,10 +70,31 @@ def open_dir_beneath(root, relative=Path('.'), create=False):
             if create:
                 try: os.mkdir(part, dir_fd=fd)
                 except FileExistsError: pass
-            child = os.open(part, flags, dir_fd=fd); os.close(fd); fd = child
+            child = os.open(part, flags, dir_fd=fd)
+            try:
+                if durable:
+                    os.fsync(child)
+                    os.fsync(fd)
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(fd); fd = child
         return fd
     except BaseException:
         os.close(fd); raise
+
+
+def fsync_file_at(fd, name, identity):
+    """Flush the proven regular inode, refusing a substituted/symlink leaf."""
+    import stat
+    leaf = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    try:
+        if not stat.S_ISREG(os.fstat(leaf).st_mode) or file_identity(os.fstat(leaf)) != tuple(identity):
+            raise PermissionError('file identity changed before fsync')
+        os.fsync(leaf)
+        assert_identity_at(fd, name, identity)
+    finally:
+        os.close(leaf)
 
 
 def file_identity(st):

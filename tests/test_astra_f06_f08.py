@@ -155,7 +155,7 @@ def test_final_review_fail_closed(tmp_path,mutation):
     elif mutation=='wrong_project': pid=p.init_project('other',scene_range=(1,3))
     elif mutation=='failed_qa': p.record_final_qa(pid,aid,QAEvidence({'ok':False},0,'test'),assembler=engine)
     elif mutation=='revoked_batch': db.execute("update approvals set revoked_at='injected' where gate='POST_BATCH'")
-    else: p.configure_project(pid,'transition','changed')
+    else: p.select_preset(pid,'presentation')
     with pytest.raises((PermissionError,AssemblyError,ValueError)):
         p.review_final(pid,aid,'APPROVED','human',assembler=engine)
     assert not p.status_summary(pid)['gates']['final']['current']
